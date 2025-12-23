@@ -192,7 +192,30 @@ class TraderHolon(Holon):
                         # Log immediately
                         print(f"[{self.name}] ⚡ SIGNAL: {entry_signal.direction} {symbol} @ {entry_signal.price:.2f}")
                         
-                        if executor:
+                        if executor and governor:
+                            # === PHASE 12: INSTITUTIONAL RISK MANAGEMENT ===
+                            # Calculate ATR reference for volatility scalar
+                            atr_series = tr.rolling(window=14).mean()
+                            atr_ref = atr_series.rolling(14).mean().iloc[-1]  # 14-period average of ATR
+                            atr_current = atr
+                            
+                            # Call governor for position sizing with Phase 12 risk management
+                            approved, safe_qty, leverage = governor.calc_position_size(
+                                symbol=symbol,
+                                asset_price=current_price,
+                                current_atr=atr_current,
+                                atr_ref=atr_ref
+                            )
+                            
+                            if not approved or safe_qty <= 0:
+                                print(f"[{self.name}] ❌ Governor REJECTED trade for {symbol}")
+                                row_data['Action'] = "BUY (GOV REJECT)"
+                                cycle_report.append(row_data)
+                                continue
+                            
+                            # Update signal with governor-approved size
+                            entry_signal.size = safe_qty
+                            
                             # 1. DQN CONTEXT
                             dqn = self.sub_holons.get('dqn')
                             rl_state = []
@@ -225,6 +248,7 @@ class TraderHolon(Holon):
                                 row_data['Action'] = f"BUY ({metabolism})"
                             else:
                                 row_data['Action'] = "BUY (HALT)"
+
                     
                     # F. EXIT MANAGEMENT & REPORTING
                     if executor:
