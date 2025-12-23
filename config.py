@@ -50,3 +50,20 @@ GOVERNOR_MIN_STACK_DIST = 0.005 # 0.5%
 GOVERNOR_MAX_MARGIN_PCT = 0.10 # 10%
 GOVERNOR_MAX_TREND_AGE_HOURS = 24.0 # Trends > 24h are exhausted
 GOVERNOR_TREND_DECAY_START = 12.0 # Start reducing risk after 12h
+
+# === PHASE 12: INSTITUTIONAL RISK MANAGEMENT ===
+# Minimax Constraint (Game Theory)
+PRINCIPAL = 10.0  # Seed capital to protect (never risk this)
+MAX_RISK_PCT = 0.01  # 1% max risk per trade
+
+# Modified Kelly Criterion (Half-Kelly)
+KELLY_RISK_REWARD = 3.0  # Expected R:R for Kelly calculation
+KELLY_LOOKBACK = 50  # Number of trades to calculate win rate
+KELLY_MIN_FRACTION = 0.05  # Minimum Kelly fraction (floor)
+KELLY_MAX_FRACTION = 0.25  # Maximum Kelly fraction (ceiling)
+
+# Volatility Scalar (Inverse Variance Weighting)
+VOL_SCALAR_PERIOD = 14  # ATR reference period
+VOL_SCALAR_MIN = 0.5  # Minimum scalar (max position reduction)
+VOL_SCALAR_MAX = 2.0  # Maximum scalar (max position increase)
+

@@ -99,9 +99,14 @@ class GovernorHolon(Holon):
                 
         return True
 
-    def calc_position_size(self, symbol: str, asset_price: float, current_atr: float = None) -> Tuple[bool, float, float]:
+    def calc_position_size(self, symbol: str, asset_price: float, current_atr: float = None, atr_ref: float = None) -> Tuple[bool, float, float]:
         """
-        Calculate position size based on metabolic state and volatility.
+        Calculate position size with Phase 12 institutional risk management.
+        
+        Integrates:
+        1. Minimax Constraint (protect principal)
+        2. Volatility Scalar (ATR-based sizing)
+        3. Modified Kelly Criterion (PREDATOR mode)
         
         Returns:
             (is_approved: bool, quantity: float, leverage: float)
@@ -124,7 +129,6 @@ class GovernorHolon(Holon):
             return False, 0.0, 0.0
             
         # 2. Price Distance Check
-        # Only if we already have a position
         last_entry = self.last_specific_entry.get(symbol, 0)
         if last_entry > 0 and symbol in self.positions:
             dist = abs(asset_price - last_entry) / last_entry
@@ -135,38 +139,22 @@ class GovernorHolon(Holon):
         
         state = self.get_metabolism_state()
         
+        # === PHASE 12: INSTITUTIONAL RISK MANAGEMENT ===
+        
+        # Base position sizing
         if state == 'SCAVENGER':
             # 10-Bullet Rule: Max margin %
             margin = min(config.SCAVENGER_MAX_MARGIN, self.balance * config.GOVERNOR_MAX_MARGIN_PCT)
             leverage = config.SCAVENGER_LEVERAGE
-            effective_size = margin * leverage
-            quantity = effective_size / asset_price
-            
-            print(f"[{self.name}] SCAVENGER: Margin ${margin:.2f}, Lev {leverage}x, Qty {quantity:.4f}")
-            return True, quantity, leverage
+            base_notional = margin * leverage
             
         else:  # PREDATOR
-            # Kelly Criterion: f* = (p(b+1) - 1) / b
-            # p = Win Rate (probability of win)
-            # b = Payoff Ratio (Avg Win / Avg Loss)
+            leverage = config.PREDATOR_LEVERAGE
             
-            # Estimate parameters from "genetic memory" (or defaults if new)
-            # Defaults: 55% Win Rate, 1.5 R:R
-            p = 0.55 
-            b = 1.5
+            # Use Modified Kelly for PREDATOR
+            kelly_size_usd = self.calculate_kelly_size(self.balance)
             
-            # Calculate Kelly Fraction
-            kelly_fraction = (p * (b + 1) - 1) / b
-            
-            # Verify positive expectancy
-            if kelly_fraction <= 0:
-                print(f"[{self.name}] KELLY: Negative Expectancy (p={p}, b={b}). Reverting to SCAVENGER.")
-                return self.calc_position_size(symbol, asset_price, current_atr) # Fallback
-                
-            # Apply "Half-Kelly" for safety (standard practice to avoid ruin)
-            safe_kelly = kelly_fraction * 0.5
-            
-            # IMP_004: Trend Age Decay
+            # Trend Age Decay
             current_pos = self.positions.get(symbol)
             if current_pos:
                 age_hours = (time.time() - current_pos.get('first_entry_time', time.time())) / 3600.0
@@ -178,31 +166,44 @@ class GovernorHolon(Holon):
                     decay = max(0.0, 1.0 - (overtime / window))
                     
                     print(f"[{self.name}] ⏳ Trend Age {age_hours:.1f}h. Decaying Kelly by {decay:.2f}x")
-                    safe_kelly *= decay
+                    kelly_size_usd *= decay
                     
                     if age_hours > config.GOVERNOR_MAX_TREND_AGE_HOURS:
                         print(f"[{self.name}] 🛑 Trend Exhausted (>24h). Rejecting Stack.")
                         return False, 0.0, 0.0
+            
+            base_notional = kelly_size_usd * leverage
+        
+        # Apply Volatility Scalar (if ATR provided)
+        if current_atr and atr_ref:
+            vol_scalar = self.calculate_volatility_scalar(current_atr, atr_ref)
+            vol_adjusted_notional = base_notional * vol_scalar
+            print(f"[{self.name}] 📊 Volatility Scalar: {vol_scalar:.2f}x (ATR: {current_atr:.6f} vs Ref: {atr_ref:.6f})")
+        else:
+            vol_adjusted_notional = base_notional
+            vol_scalar = 1.0
+        
+        # Apply Minimax Constraint (CRITICAL)
+        max_risk_usd = self.calculate_max_risk(self.balance)
+        
+        # Assume 3% stop loss distance for risk calculation
+        stop_distance = 0.03
+        max_notional_from_risk = max_risk_usd / stop_distance
+        
+        # Take minimum of volatility-adjusted and risk-constrained
+        final_notional = min(vol_adjusted_notional, max_notional_from_risk)
+        
+        # Convert to quantity
+        quantity = final_notional / asset_price
+        
+        # Log decision
+        if state == 'SCAVENGER':
+            print(f"[{self.name}] SCAVENGER: Margin ${margin:.2f}, Lev {leverage}x, Vol Scalar {vol_scalar:.2f}x, Max Risk ${max_risk_usd:.2f}, Qty {quantity:.4f}")
+        else:
+            print(f"[{self.name}] PREDATOR (Kelly): Kelly ${kelly_size_usd:.2f}, Lev {leverage}x, Vol Scalar {vol_scalar:.2f}x, Max Risk ${max_risk_usd:.2f}, Qty {quantity:.4f}")
+        
+        return True, quantity, leverage
 
-            # Capped at max risk per trade (e.g. 20% of equity) to prevent black swans
-            safe_kelly = min(safe_kelly, 0.20)
-            
-            # Calculate dollar amount to risk
-            # For pure Kelly, this is % of TOTAL EQUITY
-            usd_to_risk = self.balance * safe_kelly
-            
-            # Convert to Quantity
-            # Assuming 1:1 leverage for base calculation, then apply leverage scalar
-            # Actually Kelly returns "Percentage of Bankroll to Bet".
-            # In crypto futures, "Bet" is Margin * Leverage.
-            
-            # Let's treat safe_kelly as "Target Exposure %".
-            target_exposure = self.balance * safe_kelly * config.PREDATOR_LEVERAGE 
-            
-            quantity = target_exposure / asset_price
-            
-            print(f"[{self.name}] PREDATOR (Kelly): Balance ${self.balance:.2f}, Kelly {kelly_fraction:.2f} -> Safe {safe_kelly:.2f}. Allocating ${target_exposure:.2f} (Qty: {quantity:.4f})")
-            return True, quantity, config.PREDATOR_LEVERAGE
             
     def open_position(self, symbol: str, direction: str, entry_price: float, quantity: float):
         """Track that a position has been opened or added to (Weighted Average)."""
@@ -254,6 +255,109 @@ class GovernorHolon(Holon):
         if self.reference_atr is None:
             self.reference_atr = atr
             print(f"[{self.name}] Reference ATR set: {atr:.6f}")
+
+    # === PHASE 12: INSTITUTIONAL RISK MANAGEMENT ===
+    
+    def calculate_max_risk(self, balance: float) -> float:
+        """
+        Minimax Constraint (Game Theory):
+        Never risk the principal ($10). Only risk house money OR 1% of total.
+        
+        Args:
+            balance: Current account balance
+            
+        Returns:
+            Maximum USD that can be risked on a single trade
+        """
+        house_money = max(0, balance - config.PRINCIPAL)
+        pct_risk = balance * config.MAX_RISK_PCT
+        
+        # Whichever is lower: house money or 1% of total
+        max_risk_usd = min(house_money, pct_risk)
+        
+        return max_risk_usd
+    
+    def calculate_volatility_scalar(self, atr_current: float, atr_ref: float) -> float:
+        """
+        Volatility Scalar (Inverse Variance Weighting):
+        Normalize position size based on current volatility.
+        
+        Formula: Size_adj = Size_base × (ATR_ref / ATR_current)
+        
+        Args:
+            atr_current: Current ATR value
+            atr_ref: Reference ATR (14-period average)
+            
+        Returns:
+            Scalar multiplier (clamped to 0.5-2.0)
+        """
+        if atr_current <= 0 or atr_ref <= 0:
+            return 1.0
+        
+        # Inverse relationship: high volatility = smaller size
+        scalar = atr_ref / atr_current
+        
+        # Clamp to reasonable range
+        return max(config.VOL_SCALAR_MIN, min(config.VOL_SCALAR_MAX, scalar))
+    
+    def calculate_recent_win_rate(self, lookback: int = None) -> float:
+        """
+        Calculate win rate from recent trades.
+        
+        Args:
+            lookback: Number of recent trades to analyze
+            
+        Returns:
+            Win rate (0.0 to 1.0)
+        """
+        if lookback is None:
+            lookback = config.KELLY_LOOKBACK
+        
+        # This would need database access - for now return conservative default
+        # TODO: Integrate with database_manager to get actual win rate
+        return 0.40  # Conservative default
+    
+    def calculate_kelly_size(self, balance: float, win_rate: float = None, risk_reward: float = None) -> float:
+        """
+        Modified Kelly Criterion (Half-Kelly):
+        Calculate optimal position size for PREDATOR mode.
+        
+        Formula: f* = [(p(b+1) - 1) / b] × 0.5
+        
+        Args:
+            balance: Current account balance
+            win_rate: Recent win rate (0.0 to 1.0)
+            risk_reward: Expected reward/risk ratio
+            
+        Returns:
+            Maximum position size in USD
+        """
+        # Only use surplus, not principal
+        surplus = max(0, balance - config.PRINCIPAL)
+        
+        if surplus <= 0:
+            return 0.0
+        
+        # Use defaults if not provided
+        if win_rate is None:
+            win_rate = self.calculate_recent_win_rate()
+        if risk_reward is None:
+            risk_reward = config.KELLY_RISK_REWARD
+        
+        if win_rate <= 0:
+            return 0.0
+        
+        # Kelly formula: f* = [p(b+1) - 1] / b
+        b = risk_reward
+        kelly_fraction = ((win_rate * (b + 1)) - 1) / b
+        
+        # Half-Kelly for safety
+        half_kelly = kelly_fraction * 0.5
+        
+        # Clamp to reasonable range
+        safe_fraction = max(config.KELLY_MIN_FRACTION, min(config.KELLY_MAX_FRACTION, half_kelly))
+        
+        return surplus * safe_fraction
 
     def receive_message(self, sender: Any, content: Any) -> Any:
         """Handle incoming messages."""
