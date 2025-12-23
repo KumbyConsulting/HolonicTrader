@@ -169,6 +169,11 @@ class TraderHolon(Holon):
                         if current_capital > config.SCAVENGER_THRESHOLD:
                             metabolism = 'PREDATOR'
                     
+                    # === PHASE 12 FIX: Update Governor Balance ===
+                    # CRITICAL: Governor needs current balance for minimax constraint
+                    if governor:
+                        governor.update_balance(current_capital)
+                    
                     # Generate Entry Signal
                     # PRE-CHECK: Skip if Governor will reject
                     is_allowed = True
