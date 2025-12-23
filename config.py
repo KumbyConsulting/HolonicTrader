@@ -4,6 +4,14 @@ NEXUS Configuration (Phase 15)
 Central storage for all thresholds, leverage caps, and system parameters.
 """
 
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+API_KEY = os.getenv('KRAKEN_API_KEY')
+API_SECRET = os.getenv('KRAKEN_PRIVATE_KEY')
+
 # === METABOLIC STATE THRESHOLDS ===
 SCAVENGER_THRESHOLD = 12.0  # Balance <= this = Scavenger Mode
 INITIAL_CAPITAL = 10.0       # Never risk the principal
