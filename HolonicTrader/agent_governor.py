@@ -14,12 +14,13 @@ import config
 import time
 
 class GovernorHolon(Holon):
-    def __init__(self, name: str = "GovernorAgent", initial_balance: float = 10.0):
+    def __init__(self, name: str = "GovernorAgent", initial_balance: float = 10.0, db_manager: Any = None):
         super().__init__(name=name, disposition=Disposition(autonomy=0.9, integration=0.9))
         
         self.balance = initial_balance
         self.hard_stop_threshold = 5.0
         self.DEBUG = False # Silence rejection spam
+        self.db_manager = db_manager  # For win rate tracking
         
         # Reference ATR for volatility targeting (set during first cycle)
         self.reference_atr = None
@@ -43,7 +44,6 @@ class GovernorHolon(Holon):
                 self.positions[symbol] = {
                     'direction': 'LONG', # Assuming LONG for now
                     'entry_price': entry_price,
-                    'quantity': qty,
                     'quantity': qty,
                     'stack_count': 1, # Assume initial entry for synced positions
                     'first_entry_time': time.time() # Sync time as approx start
@@ -226,16 +226,12 @@ class GovernorHolon(Holon):
                 'direction': direction,
                 'entry_price': avg_price,
                 'quantity': new_qty,
-                'quantity': new_qty,
                 'stack_count': existing.get('stack_count', 1) + 1,
                 'first_entry_time': existing.get('first_entry_time', time.time())
             }
             print(f"[{self.name}] Position STACKED: {symbol} (New Avg: {avg_price:.4f}, Total Qty: {new_qty:.4f}, Stacks: {existing.get('stack_count', 1) + 1})")
         else:
             self.positions[symbol] = {
-                'direction': direction,
-                'entry_price': entry_price,
-                'quantity': quantity,
                 'direction': direction,
                 'entry_price': entry_price,
                 'quantity': quantity,
@@ -313,9 +309,22 @@ class GovernorHolon(Holon):
         if lookback is None:
             lookback = config.KELLY_LOOKBACK
         
-        # This would need database access - for now return conservative default
-        # TODO: Integrate with database_manager to get actual win rate
-        return 0.40  # Conservative default
+        # Integrate with database to get actual win rate
+        if hasattr(self, 'db_manager') and self.db_manager:
+            try:
+                # Get recent trades from database
+                trades = self.db_manager.get_recent_trades(lookback)
+                if trades and len(trades) > 0:
+                    # Calculate win rate
+                    wins = sum(1 for t in trades if t.get('pnl', 0) > 0)
+                    win_rate = wins / len(trades)
+                    print(f"[{self.name}] 📊 Win Rate: {win_rate*100:.1f}% (from {len(trades)} trades)")
+                    return win_rate
+            except Exception as e:
+                print(f"[{self.name}] ⚠️ Win rate calculation failed: {e}")
+        
+        # Conservative default if database unavailable
+        return 0.40
     
     def calculate_kelly_size(self, balance: float, win_rate: float = None, risk_reward: float = None) -> float:
         """

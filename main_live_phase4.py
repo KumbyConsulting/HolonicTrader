@@ -70,7 +70,7 @@ def main_live(status_queue: Queue = None, stop_event: threading.Event = None):
     dqn = DeepQLearningHolon()
     
     # 2. Instantiate Execution Stack
-    governor = GovernorHolon(initial_balance=config.INITIAL_CAPITAL)
+    governor = GovernorHolon(initial_balance=config.INITIAL_CAPITAL, db_manager=db)
     actuator = ActuatorHolon()
     executor = ExecutorHolon(
         initial_capital=config.INITIAL_CAPITAL,
