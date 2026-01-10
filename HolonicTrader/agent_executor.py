@@ -16,7 +16,7 @@ import config
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-from typing import Any, Literal, List, Optional, Dict
+from typing import Any, Literal, List, Optional, Dict, Tuple
 import math
 
 from HolonicTrader.holon_core import Holon, Disposition, Message
@@ -31,6 +31,7 @@ class TradeSignal:
     direction: Literal['BUY', 'SELL']
     size: float
     price: float
+    conviction: float = 0.5
     metadata: Dict = field(default_factory=dict)
 
 
@@ -44,6 +45,7 @@ class TradeDecision:
     adjusted_size: float
     disposition: Disposition
     block_hash: str
+    entropy_score: float = 0.0
 
 
 class ExecutorHolon(Holon):
@@ -169,7 +171,8 @@ class ExecutorHolon(Holon):
         fixed_stake: float = 10.0,
         db_manager: Any = None,
         governor: Any = None,
-        actuator: Any = None
+        actuator: Any = None,
+        gui_queue: Any = None # NEW: Dashboard Link
     ):
         """
         Initialize the ExecutorHolon with a neutral disposition and starting capital.
@@ -194,6 +197,7 @@ class ExecutorHolon(Holon):
         self.db_manager = db_manager
         self.governor = governor
         self.actuator = actuator
+        self.gui_queue = gui_queue # Store reference
         
         # Portfolio Management
         self.initial_capital = initial_capital
@@ -264,17 +268,24 @@ class ExecutorHolon(Holon):
     def reconcile_exchange_positions(self):
         """
         Fetch REAL positions from Exchange and sync them to Brain.
-        Critical for recovering from crashes where DB didn't save the trade.
+        HARD RESET: Wipes local state and re-imports entirely from exchange truth.
         """
         if not self.actuator: return
         
-        print(f"[{self.name}] 🔄 Reconciling Exchange Positions...")
+        print(f"[{self.name}] 🔄 Reconciling Exchange Positions (HARD RESET)...")
         try:
             positions = self.actuator.exchange.fetch_positions()
             
+            # --- HARD RESET: Wipe all local positions first ---
+            old_positions = dict(self.held_assets)
+            self.held_assets.clear()
+            self.entry_prices.clear()
+            self.entry_timestamps.clear()
+            self.position_metadata.clear()
+            
             synced_count = 0
             for p in positions:
-                size = float(p['contracts']) 
+                size = float(p.get('contracts', 0))
                 if size == 0: continue
                 
                 # 1. Map Exchange Symbol -> Internal Symbol
@@ -293,11 +304,8 @@ class ExecutorHolon(Holon):
                             
                 if not internal_sym:
                     # HEURISTIC: Try to guess (XRP/USD:USD -> XRP/USDT)
-                    raw = exchange_sym.split('/')[0] # 'XRP' or 'PF_XRPUSD'
-                    # Strip PF_
-                    if raw.startswith('PF_'): raw = raw[3:6] # PF_XRP -> XRP
-                    
-                    # Try adding /USDT
+                    raw = exchange_sym.split('/')[0]
+                    if raw.startswith('PF_'): raw = raw[3:6]
                     guess = f"{raw}/USDT"
                     if guess in config.ALLOWED_ASSETS:
                         internal_sym = guess
@@ -305,56 +313,105 @@ class ExecutorHolon(Holon):
                 if not internal_sym:
                     print(f"[{self.name}] ⚠️ Unknown Position Found: {exchange_sym} ({size}). Skipping.")
                     continue
-                    
-                # 2. Check if we already know it
-                if internal_sym in self.held_assets and abs(self.held_assets[internal_sym] - size) < 0.1:
-                    continue
-                    
-                # 3. Import Ghost Position
-                print(f"[{self.name}] 👻 FOUND GHOST POSITION: {internal_sym} Size: {size} Entry: {p['entryPrice']}")
                 
-                # Assign to internal state
-                self.held_assets[internal_sym] = size if p['side'] == 'long' else -size
-                self.entry_prices[internal_sym] = float(p['entryPrice'])
+                # 2. Import this position from exchange
+                direction = 'BUY' if p['side'] == 'long' else 'SELL'
+                entry_price = float(p.get('entryPrice', 0.0))
+                leverage = float(p.get('leverage', 1.0) or 1.0)
+                
+                # Check if this differs from what we had before
+                old_qty = old_positions.get(internal_sym, 0.0)
+                if abs(old_qty - size) > 0.0001 or old_qty == 0:
+                    print(f"[{self.name}] 📥 Importing: {internal_sym} ({direction}) Size: {size} Entry: {entry_price}")
+                
+                self.held_assets[internal_sym] = size if direction == 'BUY' else -size
+                self.entry_prices[internal_sym] = entry_price
                 self.entry_timestamps[internal_sym] = datetime.now(timezone.utc).isoformat()
                 
-                # Reconstruct Metadata using Default Config Protection
-                # (Since we don't know the original strategy, we assume PREDATOR defaults for safety)
-                direction_mult = 1.0 if p['side'] == 'long' else -1.0
-                entry_p = float(p['entryPrice'])
-                
-                # Default Hard Stop (Equity Protection)
-                sl_price = entry_p * (1.0 - (config.PREDATOR_STOP_LOSS * direction_mult))
-                
-                # Default Take Profit (Target)
-                tp_price = entry_p * (1.0 + (config.PREDATOR_TAKE_PROFIT * direction_mult))
+                # Reconstruct Metadata
+                direction_mult = 1.0 if direction == 'BUY' else -1.0
+                sl_price = entry_price * (1.0 - (config.PREDATOR_STOP_LOSS * direction_mult))
+                tp_price = entry_price * (1.0 + (config.PREDATOR_TAKE_PROFIT * direction_mult))
                 
                 self.position_metadata[internal_sym] = {
                     'symbol': internal_sym,
-                    'direction': 'BUY' if p['side'] == 'long' else 'SELL',
+                    'direction': direction,
                     'quantity': size,
-                    'entry_price': entry_p,
+                    'entry_price': entry_price,
                     'entry_timestamp': self.entry_timestamps[internal_sym],
-                    'leverage': float(p.get('leverage', 1.0) or 1.0),
+                    'leverage': leverage,
                     'stop_loss': sl_price,
                     'take_profit': tp_price,
-                    'strategy': 'RECOVERED'
+                    'strategy': 'RECOVERED',
+                    'stack_count': 1 # Default to 1 on fresh import (Can't know history unless mapped)
                 }
                 synced_count += 1
                 
+            # Report any positions that were in old_positions but NOT re-imported (i.e., ghosts)
+            for old_sym, old_qty in old_positions.items():
+                if abs(old_qty) > 0.00000001 and old_sym not in self.held_assets:
+                    print(f"[{self.name}] 👻 GHOST CLEARED: {old_sym} ({old_qty}) - not on exchange")
+            
             if synced_count > 0:
                 print(f"[{self.name}] ✅ Imported {synced_count} positions from Exchange.")
-                # Force Guardian Watermark Initialization via Governor? 
-                # No, Executor doesn't talk to Guardian directly. 
-                # But Guardian will pick it up on next cycle.
+            else:
+                print(f"[{self.name}] ✅ No open positions on Exchange.")
                 
-                if self.governor:
-                    self.governor.sync_positions(self.held_assets, self.position_metadata)
-                if self.db_manager:
-                    self.db_manager.save_portfolio(self.balance_usd, self.held_assets, self.position_metadata)
+            if self.db_manager:
+                self.db_manager.save_portfolio(self.balance_usd, self.held_assets, self.position_metadata)
                 
+            # Notify Governor
+            if self.governor:
+                self.governor.sync_positions(self.held_assets, self.position_metadata)
+
         except Exception as e:
             print(f"[{self.name}] ❌ Reconciliation Failed: {e}")
+
+
+    def sync_balance(self, confirmed_balance: float):
+        """
+        Force-update the internal balance to match Reality (Exchange).
+        Overrides any stale DB state.
+        """
+        if abs(self.balance_usd - confirmed_balance) > 0.01:
+            print(f"[{self.name}] 📉 Ledger Correction: Overwriting DB Balance ${self.balance_usd:.2f} with Real Capital ${confirmed_balance:.2f}")
+            self.balance_usd = confirmed_balance
+            self.initial_capital = confirmed_balance # update basis too
+            self._persist_portfolio()
+        else:
+             print(f"[{self.name}] ✅ Ledger Balance Verified: ${self.balance_usd:.2f}")
+
+    def gc_reconcile_positions(self) -> list:
+        """
+        Garbage Collector: Full bidirectional position sync with exchange.
+        Returns list of ghost positions that were zeroed out.
+        """
+        verbose = getattr(config, 'GC_LOG_VERBOSE', True)
+        ghosts_found = []
+        
+        if verbose:
+            print(f"[GC Monitor] 🔄 Running Position Reconciliation...")
+        
+        # Store current state to detect what changes
+        before_assets = dict(self.held_assets)
+        
+        # Run the main reconciliation logic
+        self.reconcile_exchange_positions()
+        
+        # Detect what was removed (ghost positions)
+        for sym, qty in before_assets.items():
+            if abs(qty) > 0.00000001:
+                new_qty = self.held_assets.get(sym, 0.0)
+                if abs(new_qty) < 0.00000001:
+                    ghosts_found.append(sym)
+        
+        if verbose and ghosts_found:
+            print(f"[GC Monitor] ✅ Position Reconciliation: {len(ghosts_found)} ghosts cleared: {ghosts_found}")
+        elif verbose:
+            print(f"[GC Monitor] ✅ Position Reconciliation: Clean - no discrepancies.")
+        
+        return ghosts_found
+
 
     def get_execution_summary(self) -> dict:
         """Returns a high-level summary of execution status and portfolio health."""
@@ -374,7 +431,26 @@ class ExecutorHolon(Holon):
 
 
 
-    def check_stop_loss_take_profit(self, symbol: str, current_price: float) -> Optional[str]:
+    def get_balance_details(self) -> Tuple[float, float]:
+        """
+        Returns (Total Equity, Free Margin).
+        Used for Solvency Checks.
+        """
+        if self.actuator:
+            # Equity = Total Net Worth (use specific equity method)
+            equity = self.actuator.get_equity()
+            # Free = Account Balance (Cash/Available Margin)
+            free = self.actuator.get_account_balance()
+            return equity, free
+        else:
+            return self.balance_usd, self.balance_usd
+
+    def get_portfolio_value(self, current_price: float = 0.0) -> float:
+        """Alias for Equity (Legacy Support)."""
+        eq, _ = self.get_balance_details()
+        return eq
+
+    def check_stop_loss_take_profit(self, symbol: str, current_price: float) -> Optional[Tuple[str, str]]:
         """
         Check if current price triggers Stop-Loss or Take-Profit for a specific symbol.
         Direction-aware (Long/Short).
@@ -445,8 +521,10 @@ class ExecutorHolon(Holon):
         # - Adjusted to 0.75 to enable HALT/REDUCE triggers        # - Live data max entropy: ~1.85
         # - Gaussian Noise: ~1.40
         # - Phase 34 Tuned Threshold: 1.1 (Midpoint of new Transition zone)
+        # - Phase 35 Update: Raised to 1.5 to handle high-entropy assets (DOT, XTZ showing 1.8-1.9)
+        # - UNLEASHED (Phase 36): Raised to 2.2 to basically disable the Halt. (Max Entropy ~2.3)
         k = 5.0
-        threshold = 1.1  # Adjusted from 0.75 to match relaxed calibration
+        threshold = 2.2  # UNLEASHED MODE: High tolerance for Chaos
         
         # Ranges:
         # Entropy < 1.0 (Ordered) -> Autonomy > 0.7
@@ -464,18 +542,19 @@ class ExecutorHolon(Holon):
         # Autonomy < 0.4 -> HALT (High Safety)
         # 0.4 <= Autonomy <= 0.6 -> REDUCE (Balanced)
         
-        if autonomy > 0.6:
+        if autonomy > 0.5:  # Relaxed from 0.6 to allow more entries
             action = 'EXECUTE'
             adjusted_size = signal.size
             
-        elif autonomy < 0.2: # Harder floor for total rejection
+        elif autonomy < 0.05:  # Very relaxed - only HALT in extreme chaos
             action = 'HALT'
             adjusted_size = 0.0
+            print(f"[{self.name}] ⚠️ HALT: Autonomy too low ({autonomy:.3f}), Entropy: {entropy_score:.2f}")
             
         else:
-            # SOFT-HALT / REDUCE Range (0.2 - 0.6 autonomy)
+            # SOFT-HALT / REDUCE Range (0.05 - 0.5 autonomy)
             action = 'REDUCE'
-            # Scale participation: 25% minimum, up to 100% near 0.6
+            # Scale participation: 25% minimum, up to 100% near 0.5
             adjusted_size = signal.size * max(0.25, autonomy)
 
         # Check for sufficient funds/assets
@@ -503,8 +582,10 @@ class ExecutorHolon(Holon):
             original_signal=signal,
             adjusted_size=adjusted_size,
             disposition=self.disposition,
-            block_hash=block.hash
+            block_hash=block.hash,
+            entropy_score=entropy_score
         )
+
 
     def record_external_decision(
         self,
@@ -545,7 +626,8 @@ class ExecutorHolon(Holon):
             original_signal=signal,
             adjusted_size=adjusted_size,
             disposition=self.disposition,
-            block_hash=block.hash
+            block_hash=block.hash,
+            entropy_score=entropy_score
         )
 
     def execute_transaction(self, decision: TradeDecision, current_price: float) -> Optional[float]:
@@ -576,6 +658,66 @@ class ExecutorHolon(Holon):
 
         # 2. GOVERNOR VALIDATION & SIZING (For Entries)
         # ---------------------------------------------------------
+        
+        # --- SPAM GUARD with TIMEOUT ---
+        # Check if we already have a working order for this symbol
+        # But allow override if the order is stale (older than 70s - Actuator timeout is ~60s)
+        WORKING_ORDER_TIMEOUT = 70  # Reduced from 300s to prevent deadlocks
+        
+        if self.actuator:
+            has_pending = False
+            stale_order_indices = []
+            current_time = time.time()
+            
+            for idx, o in enumerate(getattr(self.actuator, 'pending_orders', [])):
+                if o.get('symbol') == symbol:
+                    order_age = current_time - o.get('timestamp', current_time)
+                    
+                    if order_age > WORKING_ORDER_TIMEOUT:
+                        # Order is stale, mark for removal
+                        stale_order_indices.append(idx)
+                        print(f"[{self.name}] ⏰ STALE WORKING ORDER: {symbol} ({order_age:.0f}s old). Clearing.")
+                    else:
+                        has_pending = True
+                        break
+            
+            # Remove stale orders (in reverse to preserve indices)
+            for idx in reversed(stale_order_indices):
+                try:
+                    stale_order = self.actuator.pending_orders.pop(idx)
+                    print(f"[{self.name}] 🗑️ Removed stale order {stale_order.get('id', 'N/A')}")
+                except:
+                    pass
+                        
+            if has_pending:
+                # --- EMERGENCY OVERRIDE FOR STOP LOSS ---
+                signal_reason = decision.original_signal.metadata.get('reason', '')
+                if signal_reason == 'STOP_LOSS':
+                    print(f"[{self.name}] 🚨 EMERGENCY STOP LOSS: Cancelling conflicting working orders for {symbol} to force exit.")
+                    
+                    orders_to_cancel = [o for o in self.actuator.pending_orders if o.get('symbol') == symbol]
+                    
+                    for order_record in orders_to_cancel:
+                        order_id = order_record.get('id')
+                        try:
+                            # Try to force cancel on exchange via Actuator's connection
+                            if self.actuator and hasattr(self.actuator, 'exchange'):
+                                self.actuator.exchange.cancel_order(order_id, symbol)
+                                print(f"[{self.name}] 🗑️ Force Cancelled Order {order_id}")
+                        except Exception as e:
+                            print(f"[{self.name}] ⚠️ Force Cancel Failed for {order_id}: {e}")
+                        
+                        # Remove from pending list to unlock execution
+                        if order_record in self.actuator.pending_orders:
+                            self.actuator.pending_orders.remove(order_record)
+                    
+                    # Proceed with execution (has_pending check bypassed)
+                    pass 
+                else: 
+                    print(f"[{self.name}] ⏳ Working Order exists for {symbol}. Skipping duplicate execution.")
+                    return None
+        # ------------------
+
         leverage = 1.0
         exec_qty = 0.0
         
@@ -596,8 +738,10 @@ class ExecutorHolon(Holon):
                     'type': 'VALIDATE_TRADE', 
                     'price': current_price, 
                     'symbol': symbol,
+                    'direction': direction,
                     'atr': meta_atr,
-                    'conviction': meta_conviction
+                    'conviction': meta_conviction,
+                    'crisis_score': decision.entropy_score
                 })
                 
                 if not is_approved:
@@ -638,7 +782,7 @@ class ExecutorHolon(Holon):
                 
                 # Check Min Order Value again after capping
                 if (max_qty * current_price) < config.MIN_ORDER_VALUE:
-                    print(f"  [SOLVENCY] ❌ Insufficient Buying Power. Req: ${config.MIN_ORDER_VALUE}, Power: ${notional_req:.2f}/{safe_capital:.2f}")
+                    print(f"  [SOLVENCY] ❌ Insufficient Buying Power. Req: ${config.MIN_ORDER_VALUE}, Power: ${max_affordable_notional:.2f} (Nav: ${safe_capital:.2f})")
                     return None
                     
                 print(f"  [SOLVENCY] Capping Qty {exec_qty:.4f} -> {max_qty:.4f} (Power ${avail_capital:.2f})")
@@ -666,34 +810,108 @@ class ExecutorHolon(Holon):
             
             # --- PATCH: PASS LEVERAGE ---
             # We must pass the leverage we calculated/retrieved to the Actuator
-            # so it can set it on the exchange before placing the order.
-            self.actuator.place_limit_order(
-                symbol=symbol, 
-                direction=direction, 
-                quantity=exec_qty, 
-                limit_price=current_price, 
-                leverage=leverage
-            )
-            # ----------------------------
+            # so it can set it on the exchange before
+            # 4. EXECUTE VIA ACTUATOR
+            # ------------------------------------------------
+            # ORDER TYPE LOGIC:
+            # - ENTRIES (Long/Short) -> MARKET (Priority: Speed/Certainty)
+            # - EXITS (Close/Reduce) -> LIMIT (Priority: Rebates/Cost)
+            #   (Unless it's a Stop Loss, which might need Market, but for now Limit w/ actuator retry logic)
             
-            fills = self.actuator.check_fills(candle_low=current_price, candle_high=current_price)
-        else:
-            # High-Fidelity Simulation
-            fills = [{
-                'symbol': symbol,
-                'direction': direction,
-                'filled_qty': exec_qty,
-                'price': current_price,
-                'cost_usd': exec_qty * current_price,
-                'timestamp': datetime.now(timezone.utc).isoformat()
-            }]
+            order_type = 'market' if (is_long_entry or is_short_entry) else 'limit'
+            
+            # Urgent if it's an Exit or Cover (We want to realize PnL, not fish for rebates endlessly)
+            urgent_flag = (is_long_exit or is_short_cover)
+            
+            # Execute
+            # Execute
+            tx_id = self.actuator.place_order(
+                symbol=symbol,
+                direction=direction, # Actuator handles side map
+                quantity=exec_qty,
+                price=current_price,
+                order_type=order_type,
+                margin=True, 
+                leverage=leverage,
+                urgent=urgent_flag,
+                reduce_only=(is_long_exit or is_short_cover)
+            )
+            
+            if tx_id:
+                print(f"[{self.name}] 📡 ORDER SENT {direction} {symbol}: {exec_qty} @ {current_price} ({order_type.upper()}). Verifying...")
+                
+                # --- HARD EXECUTION GATE (Request A/C) ---
+                # Kill Optimistic Updates. Truth comes from Exchange.
+                time.sleep(2.0) # Network propagation buffer
+                
+                # Verify Logic
+                max_retries = 3
+                confirmed_fill = None
+                
+                for attempt in range(max_retries):
+                     order_status = self.actuator.fetch_order_status(tx_id, symbol)
+                     if not order_status:
+                         time.sleep(1.0)
+                         continue
+                         
+                     status = order_status.get('status')
+                     filled = float(order_status.get('filled', 0.0))
+                     
+                     if status == 'closed' or filled > 0:
+                         # We have a fill!
+                         confirmed_fill = order_status
+                         break
+                     elif status == 'canceled' or status == 'rejected':
+                         print(f"[{self.name}] ❌ Order {tx_id} was {status}. Execution Failed.")
+                         break
+                     else:
+                         # Open/New - Wait longer
+                         time.sleep(1.0 + attempt)
+                
+                if not confirmed_fill:
+                     print(f"[{self.name}] ⚠️ EXECUTION UNCONFIRMED: Order {tx_id} not filled after verification. Dropping from State.")
+                     # FIX: Ensure we remove it from pending_orders so we can try again immediately
+                     if self.actuator:
+                         to_remove = [o for o in self.actuator.pending_orders if o.get('id') == tx_id]
+                         for o in to_remove:
+                             self.actuator.pending_orders.remove(o)
+                     return None
+                     
+                # Use CONFIRMED data for updates
+                final_fill_qty = float(confirmed_fill.get('filled', 0.0))
+                remaining = float(confirmed_fill.get('remaining', 0.0))
+                avg_price = float(confirmed_fill.get('average', current_price)) 
+                # If average is None (some exchanges), use price or current_price
+                if avg_price is None or avg_price == 0: avg_price = current_price
+                
+                # Only update fills with REAL data
+                fills = [{
+                    'symbol': symbol,
+                    'direction': direction,
+                    'filled_qty': final_fill_qty,
+                    'price': avg_price,
+                    'cost_usd': final_fill_qty * avg_price,
+                    'timestamp': datetime.now(timezone.utc).isoformat()
+                }]
+                
+                if final_fill_qty < (exec_qty * 0.9):
+                     print(f"[{self.name}] ⚠️ PARTIAL FILL: Requested {exec_qty}, Got {final_fill_qty}. State Updated.")
+            else:
+                 # Tx Failed
+                 return None
 
-        # 4. PROCESS RESULTS & UPDATE STATE
+        # 4. PROCESS RESULTS & UPDATE STATE (Now utilizing VERIFIED fills)
         # ---------------------------------------------------------
-        if not fills: return None
+        # Filter for RELEVANT fills only (Prevent Cross-Talk)
+        relevant_fills = [f for f in fills if f.get('symbol') == symbol]
         
-        fill = fills[0]
+        if not relevant_fills: return None
+        
+        fill = relevant_fills[0]
         actual_qty = fill['filled_qty']
+        
+        if actual_qty == 0: return None # Happened on partial
+        
         actual_price = fill['price']
         notional_value = fill['cost_usd']
         margin_impact = notional_value / leverage
@@ -704,7 +922,6 @@ class ExecutorHolon(Holon):
             
             # --- PATCH 4: REALITY CHECK (Fix the Math) ---
             # Ensure we are adding Quantity (Units), NOT Notional (USD)
-            # new_total_qty = old_qty + order_qty
             new_qty = old_qty + actual_qty
             
             # Sanity Guard
@@ -714,13 +931,29 @@ class ExecutorHolon(Holon):
             
             # Weighted average entry price
             old_entry = self.entry_prices.get(symbol, actual_price)
-            self.entry_prices[symbol] = ((old_qty * old_entry) + (actual_qty * actual_price)) / new_qty
+            if old_qty > 0:
+                self.entry_prices[symbol] = ((old_qty * old_entry) + (actual_qty * actual_price)) / new_qty
+            else:
+                 self.entry_prices[symbol] = actual_price
+                 
             self.held_assets[symbol] = new_qty
+            
+            # Persist original timestamp if stacking, else new
+            existing_ts = self.position_metadata.get(symbol, {}).get('entry_timestamp')
+            final_ts = existing_ts if existing_ts else datetime.now(timezone.utc).isoformat()
+            
+            # Extract PPO Metadata if available
+            ppo_state = decision.original_signal.metadata.get('ppo_state')
+            ppo_conv = decision.original_signal.metadata.get('ppo_conviction')
+
             self.position_metadata[symbol] = {
                 'leverage': leverage,
                 'entry_price': self.entry_prices[symbol],
-                'entry_timestamp': datetime.now(timezone.utc).isoformat(),
-                'direction': 'BUY'
+                'entry_timestamp': final_ts,
+                'direction': 'BUY',
+                'ppo_state': ppo_state,
+                'ppo_conviction': ppo_conv,
+                'stack_count': self.position_metadata.get(symbol, {}).get('stack_count', 0) + 1
             }
             print(f"[{self.name}] LONG ENTRY: {symbol} @ {actual_price} (Qty: {actual_qty:.4f}, NewTotal: {new_qty:.4f}, Margin: ${margin_impact:.2f})")
             
@@ -731,6 +964,7 @@ class ExecutorHolon(Holon):
             # --- PATCH 4: REALITY CHECK (Fix the Math) ---
             # new_total_qty = old_qty + order_qty
             new_qty_abs = old_qty_abs + actual_qty
+            
              # Sanity Guard
             if new_qty_abs > 1_000_000 and actual_price > 1.0:
                  print(f"[{self.name}] ⚠️ CRITICAL MATH WARNING: Phantom Whale Detected? Qty: {new_qty_abs}")
@@ -740,11 +974,23 @@ class ExecutorHolon(Holon):
             old_entry = self.entry_prices.get(symbol, actual_price)
             self.entry_prices[symbol] = ((old_qty_abs * old_entry) + (actual_qty * actual_price)) / new_qty_abs
             self.held_assets[symbol] = -new_qty_abs
+            
+            # Persist original timestamp if stacking, else new
+            existing_ts = self.position_metadata.get(symbol, {}).get('entry_timestamp')
+            final_ts = existing_ts if existing_ts else datetime.now(timezone.utc).isoformat()
+            
+            # Extract PPO Metadata if available
+            ppo_state = decision.original_signal.metadata.get('ppo_state')
+            ppo_conv = decision.original_signal.metadata.get('ppo_conviction')
+            
             self.position_metadata[symbol] = {
                 'leverage': leverage,
                 'entry_price': self.entry_prices[symbol],
-                'entry_timestamp': datetime.now(timezone.utc).isoformat(),
-                'direction': 'SELL'
+                'entry_timestamp': final_ts,
+                'direction': 'SELL',
+                'ppo_state': ppo_state,
+                'ppo_conviction': ppo_conv,
+                'stack_count': self.position_metadata.get(symbol, {}).get('stack_count', 0) + 1
             }
             print(f"[{self.name}] SHORT ENTRY: {symbol} @ {actual_price} (Qty: {actual_qty:.4f}, NewTotal: {new_qty_abs:.4f}, Margin: ${margin_impact:.2f})")
 
@@ -811,6 +1057,24 @@ class ExecutorHolon(Holon):
             })
 
         self.last_order_details = f"{direction} {actual_qty:.4f} {symbol} @ {actual_price:.2f}"
+        
+        # --- IMPROVEMENT: EMIT ORDER TO DASHBOARD ---
+        if self.gui_queue:
+            try:
+                self.gui_queue.put({
+                    'type': 'order',
+                    'data': {
+                        'Time': datetime.now().strftime('%H:%M:%S'),
+                        'Symbol': symbol,
+                        'Side': direction,
+                        'Qty': f"{actual_qty:.4f}",
+                        'Price': f"{actual_price:.4f}",
+                        'Status': 'FILLED'
+                    }
+                })
+            except: pass
+        # --------------------------------------------
+        
         return pnl_to_return
 
     def get_portfolio_value(self, current_price_ref: float = 0.0) -> float:
@@ -899,9 +1163,25 @@ class ExecutorHolon(Holon):
                 # Ideally, we knew the leverage of the position we are closing.
                 # Let's try to grab it from metadata.
                 panic_lev = self.position_metadata.get(symbol, {}).get('leverage', 1.0)
-                self.actuator.place_limit_order(symbol, direction, abs(qty), price, margin=True, leverage=panic_lev)
+                # Fix: Use place_order instead of place_limit_order, set reduce_only=True
+                self.actuator.place_order(
+                    symbol=symbol, 
+                    direction=direction, 
+                    quantity=abs(qty), 
+                    price=price, 
+                    order_type='limit',
+                    margin=True, 
+                    leverage=panic_lev,
+                    reduce_only=True,
+                    urgent=True
+                )
                 
-            # IMMEDIATE Local State Wipe (Assume filled for safety/stopping)
+                
+            # SAFE STATE WIPE: Only if order was submitted (Actuator didn't crash)
+            # Ideally we check result[id], but actuator returns None on hard failure
+            # If we used Actuator, trust the fire-and-forget nature of panic for now, 
+            # BUT at least ensure we reached the call.
+            
             self.balance_usd += (abs(qty) * price) # Roughly returning capital
             
             # Save to Ledger DB

@@ -16,15 +16,10 @@ from HolonicTrader.agent_executor import ExecutorHolon
 from HolonicTrader.agent_actuator import ActuatorHolon
 from HolonicTrader.agent_ppo import PPOHolon
 from HolonicTrader.agent_ppo import PPOHolon
-
-try:
-    from HolonicTrader.agent_telegram import TelegramHolon
-except ImportError:
-    TelegramHolon = None
-    print("⚠️ TelegramHolon module not found using robust import.")
+from HolonicTrader.agent_sentiment import SentimentHolon
+from HolonicTrader.agent_overwatch import OverwatchHolon # <--- NEW: The Sentry
 
 from database_manager import DatabaseManager
-
 
 from queue import Queue
 import threading
@@ -81,7 +76,7 @@ class QueueLogger:
         except Exception:
             pass
 
-def main_live(status_queue: Queue = None, stop_event: threading.Event = None, interval_seconds: int = 60):
+def main_live(status_queue: Queue = None, stop_event: threading.Event = None, interval_seconds: int = 60, command_queue: Queue = None):
     print("==========================================")
     print("   HOLONIC TRADER - LIVE ENVIRONMENT      ")
     print("==========================================")
@@ -94,10 +89,8 @@ def main_live(status_queue: Queue = None, stop_event: threading.Event = None, in
     if not diagnostic.run_system_check(db):
         print(">> 🛑 SYSTEM CHECK FAILED. HALTING STARTUP.")
         return
+
     # 0c. Capital Synchronization (Live & Paper)
-    # Fetch real account size to inform the simulation/live parameters
-    # 0c. Capital Synchronization (Live & Paper)
-    # Fetch real account size to inform the simulation/live parameters
     try:
         import ccxt
         print(f">> 🔄 Syncing Capital from Kraken ({config.TRADING_MODE})...")
@@ -154,6 +147,7 @@ def main_live(status_queue: Queue = None, stop_event: threading.Event = None, in
     guardian = ExitGuardianHolon()
     monitor = MonitorHolon(principal=config.INITIAL_CAPITAL)
     ppo = PPOHolon()
+    sentiment = SentimentHolon() # <--- NEW
     
     # 2. Instantiate Execution Stack
     governor = GovernorHolon(initial_balance=config.INITIAL_CAPITAL, db_manager=db)
@@ -169,23 +163,22 @@ def main_live(status_queue: Queue = None, stop_event: threading.Event = None, in
         initial_capital=config.INITIAL_CAPITAL,
         governor=governor,
         actuator=actuator,
-        db_manager=db
+        db_manager=db,
+        gui_queue=status_queue # NEW: Dashboard Link
     )
     
     # 2b. Sync Governor & Exchange
     executor.reconcile_exchange_positions() # Pull Ghost Positions first
+    executor.sync_balance(config.INITIAL_CAPITAL) # <--- FIX: Force Executor to respect Real Equity
     governor.sync_positions(executor.held_assets, executor.position_metadata)
 
-    # 2c. Telegram Bot (Robust Instantiation)
-    if stop_event is None:
-        stop_event = threading.Event()
-
-    telegram = None
-    if config.TELEGRAM_ENABLED and TelegramHolon:
-        try:
-            telegram = TelegramHolon(executor=executor, stop_event=stop_event)
-        except Exception as e:
-            print(f"⚠️ Telegram Launch Failed: {e}")
+    # 2c. Overwatch (The Sentry: Telegram + NLP)
+    overwatch = OverwatchHolon()
+    
+    # 2d. Regime Controller (Phase 7: Capital Regime Management)
+    from HolonicTrader.agent_regime import RegimeController
+    regime_controller = RegimeController()
+    governor.regime_controller = regime_controller  # Link to Governor
 
     # 3. Instantiate Trader
     trader = TraderHolon("TraderNexus", sub_holons={
@@ -197,16 +190,23 @@ def main_live(status_queue: Queue = None, stop_event: threading.Event = None, in
         'governor': governor,
         'executor': executor,
         'ppo': ppo,
-        'telegram': telegram
+        'sentiment': sentiment,
+        'overwatch': overwatch, # <--- The Sentry
+        'regime': regime_controller  # <--- Phase 7: Regime Controller
     })
-    
-    # 4. Start Loop
-    print(">> Initializing System Components...")
-    
+
+    trader_ref_linked = False
     try:
-        # 4. Integrate Stop Signals & Queue
+        # 4. Link Overwatch to Trader (Circular Dependency Resolution)
+        if overwatch:
+            overwatch.trader = trader
+            trader_ref_linked = True
+            print(">> [System] Overwatch Linked to TraderNexus.")
+
+        # 4b. Integrate Stop Signals & Queue
         trader.gui_queue = status_queue
         trader.gui_stop_event = stop_event
+        trader.command_queue = command_queue # <--- NEW: Command Link
         
         # 5. Start Loop
         print(">> Initializing System Components...")
@@ -219,9 +219,20 @@ def main_live(status_queue: Queue = None, stop_event: threading.Event = None, in
         import traceback
         traceback.print_exc()
     finally:
+        # Proper Resource Cleanup
+        print(">> Cleaning up resources...")
+        try:
+            if overwatch:
+                overwatch.stop()
+        except Exception:
+            pass
+        try:
+            db.close()
+        except Exception:
+            pass
         print(">> SYSTEM SHUTDOWN COMPLETE.")
 
-def run_bot(stop_event, status_queue, config_dict=None):
+def run_bot(stop_event, status_queue, config_dict=None, command_queue=None):
     """Wrapper for GUI Thread"""
     # Setup Logger
     log_file = f"live_trading_session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -244,14 +255,17 @@ def run_bot(stop_event, status_queue, config_dict=None):
             
             # Dynamic leverage and allocation
             config.GOVERNOR_MAX_MARGIN_PCT = float(config_dict.get('max_allocation', config.GOVERNOR_MAX_MARGIN_PCT))
-            # We map leverage based on metabolism, but for simplicity we set PREDATOR leverage cap
             config.PREDATOR_LEVERAGE = float(config_dict.get('leverage_cap', config.PREDATOR_LEVERAGE))
             
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Config Applied: Allocation {config.GOVERNOR_MAX_MARGIN_PCT*100:.1f}%, Leverage {config.PREDATOR_LEVERAGE}x")
+            # Dynamic Micro Mode
+            if 'micro_mode' in config_dict:
+                config.MICRO_CAPITAL_MODE = bool(config_dict['micro_mode'])
+            
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Config Applied: Allocation {config.GOVERNOR_MAX_MARGIN_PCT*100:.1f}%, Leverage {config.PREDATOR_LEVERAGE}x, MicroMode: {config.MICRO_CAPITAL_MODE}")
             
         # 1. Start Loop (Check if GUI provided a specific interval, else default to 60)
         interval = config_dict.get('loop_interval', 60) if config_dict else 60
-        main_live(status_queue, stop_event, interval_seconds=interval)
+        main_live(status_queue, stop_event, interval_seconds=interval, command_queue=command_queue)
     except Exception as e:
         print(f"Bot Crashed: {e}")
 

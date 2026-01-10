@@ -83,18 +83,39 @@ class DiagnosticHolon(Holon):
         print("      ✅ All Core Models Found")
         return True
 
-    def check_exchange(self, exchange_id='kucoin'):
-        """Checks connectivity to the exchange (public endpoint)."""
-        print(f"   [Diagnostic] Checking Exchange Connectivity ({exchange_id})...")
+    def check_exchange(self, exchange_id=None):
+        """Checks connectivity to BOTH Data Source (KuCoin) and Trading Venue (Kraken)."""
+        success = True
+        
+        # 1. Check Data Source (Default: KuCoin)
+        # We check this first as it failed previously
+        data_exchange = 'kucoin'
+        print(f"   [Diagnostic] Checking Data Source ({data_exchange})...")
         try:
-            exchange_class = getattr(ccxt, exchange_id)
-            exchange = exchange_class()
-            exchange.load_markets() # Minimal call to fetch markets
-            print("      ✅ Exchange Connectivity OK")
-            return True
+            ex = getattr(ccxt, data_exchange)()
+            ex.load_markets()
+            print("      ✅ Data Feed Connected")
         except Exception as e:
-            print(f"      ❌ Exchange Connection Failed: {e}")
-            return False
+            print(f"      ❌ Data Feed Connection Failed ({data_exchange}): {e}")
+            # If Data Source fails, it's critical, BUT for now we might wanna check trading too
+            success = False
+
+        # 2. Check Execution Venue
+        if getattr(config, 'TRADING_MODE', 'SPOT') == 'FUTURES':
+             trade_exchange = 'krakenfutures'
+        else:
+             trade_exchange = 'kraken'
+             
+        print(f"   [Diagnostic] Checking Trading Venue ({trade_exchange})...")
+        try:
+            ex = getattr(ccxt, trade_exchange)()
+            ex.load_markets()
+            print("      ✅ Execution Venue Connected")
+        except Exception as e:
+             print(f"      ❌ Trading Venue Connection Failed: {e}")
+             success = False
+             
+        return success
 
     def check_logs(self, lookback_days=1):
         """

@@ -30,6 +30,39 @@ class MonitorHolon(Holon):
         # Immune System State
         self.daily_start_balance = principal
         self.last_day_reset = None # To track 24h cycles
+        
+        # --- FIX: AMNESIA (Load State) ---
+        self._load_state()
+
+    def _load_state(self):
+        """Restore daily tracking from disk."""
+        import json
+        import os
+        try:
+            path = os.path.join(os.getcwd(), 'monitor_state.json')
+            if os.path.exists(path):
+                with open(path, 'r') as f:
+                    data = json.load(f)
+                    self.daily_start_balance = data.get('daily_start_balance', self.principal)
+                    self.last_day_reset = data.get('last_day_reset')
+                    print(f"[{self.name}] 🧠 Memory Restored: Day Start Balance=${self.daily_start_balance:.2f}")
+        except Exception as e:
+            print(f"[{self.name}] ⚠️ Memory Load Failed: {e}")
+
+    def _save_state(self):
+        """Persist daily tracking."""
+        import json
+        import os
+        try:
+            path = os.path.join(os.getcwd(), 'monitor_state.json')
+            data = {
+                'daily_start_balance': self.daily_start_balance,
+                'last_day_reset': self.last_day_reset
+            }
+            with open(path, 'w') as f:
+                json.dump(data, f)
+        except Exception as e:
+            print(f"[{self.name}] ⚠️ Memory Save Failed: {e}")
 
     def update_health(self, executor_summary: dict, performance_data: dict) -> bool:
         """
@@ -47,6 +80,7 @@ class MonitorHolon(Holon):
             print(f"[{self.name}] 🌅 NEW DAY: Resetting Daily Balance Tracker (${current_equity:.2f})")
             self.daily_start_balance = current_equity
             self.last_day_reset = current_time
+            self._save_state() # <--- Persist immediately
 
         # --- PHASE 36: LIQUIDATION ENGINE (Solvency Check) ---
         maintenance_margin = margin_used * config.MAINTENANCE_MARGIN_RATE

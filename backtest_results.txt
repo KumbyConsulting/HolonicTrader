@@ -1,0 +1,9 @@
+Strategy Comparison (2 Years BTC 15m)
+Metric | Baseline (RSI) | Fractal (RSI+Trend)
+--- | --- | ---
+Trades | 909 | 108
+Win Rate | 65.68% | 77.78%
+Equity | $928.85 | $1430.49
+Profit Factor | 0.93x | 1.43x
+
+✅ Hypothesis Confirmed: Fractal Filtering improved performance.

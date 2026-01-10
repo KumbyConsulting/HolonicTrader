@@ -15,7 +15,8 @@ import time
 import ccxt
 import config
 import os
-from typing import Any, Literal
+import random
+from typing import Any, Literal, Dict
 from HolonicTrader.holon_core import Holon, Disposition, Message
 
 class ActuatorHolon(Holon):
@@ -58,8 +59,12 @@ class ActuatorHolon(Holon):
         Rule: Top 10 levels must have cumulative volume >= 3x order quantity.
         """
         try:
-            # Fetch shallow book (Limit 10 is fast/cheap)
-            book = self.exchange.fetch_order_book(symbol, limit=10)
+            if price <= 0:
+                print(f"[{self.name}] ⚠️ Liquidity Check Skipped: Invalid Price ({price})")
+                return True
+
+            # Fetch deeper book (Limit 50 for safety)
+            book = self.exchange.fetch_order_book(symbol, limit=50)
             
             # If Buying, we consume Asks. If Selling, we hit Bids.
             # (Limit orders technically wait, but we want to know there's a market nearby)
@@ -92,88 +97,141 @@ class ActuatorHolon(Holon):
         """
         Fetch REAL free balance from exchange.
         """
-        try:
-            balance = self.exchange.fetch_balance()
-            # Kraken might have 'USD' or 'USDT' or 'ZUSD'
-            # Try a few common quote currencies
-            b_usd = balance['free'].get('USD', 0.0)
-            b_usdt = balance['free'].get('USDT', 0.0)
-            b_zusd = balance['free'].get('ZUSD', 0.0)
-            
-            total_avail = max(b_usd, b_usdt, b_zusd)
-            # print(f"[{self.name}] 💰 Real Balance: ${total_avail:.2f}")
-            return total_avail
-        except Exception as e:
-            print(f"[{self.name}] ❌ Balance Check Failed: {e}")
-            return 0.0
+        for attempt in range(3):
+            try:
+                balance = self.exchange.fetch_balance()
+                
+                # Check for Unified Margin 'total' or 'free'
+                # Kraken Futures usually puts USD in 'free'
+                b_usd = balance['free'].get('USD', 0.0)
+                b_usdt = balance['free'].get('USDT', 0.0)
+                b_zusd = balance['free'].get('ZUSD', 0.0)
+                
+                total_avail = max(b_usd, b_usdt, b_zusd)
+                # print(f"[{self.name}] 💰 Real Balance: ${total_avail:.2f}")
+                return total_avail
+            except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+                if attempt == 2:
+                    print(f"[{self.name}] ❌ Balance Check Failed after 3 attempts: {e}")
+                    return 0.0
+                time.sleep(1 * (attempt+1))
+        return 0.0
+
+    def get_equity(self) -> float:
+        """
+        Fetch TOTAL EQUITY (Balance + Unrealized PnL).
+        Crucial for accurate Drawdown calculation in Governor.
+        """
+        for attempt in range(3):
+            try:
+                balance = self.exchange.fetch_balance()
+                info = balance.get('info', {})
+                
+                # 1. Futures: Explicit marginEquity
+                if config.TRADING_MODE == 'FUTURES':
+                    accounts = info.get('accounts', {})
+                    flex = accounts.get('flex', {})
+                    total_equity = float(flex.get('marginEquity', 0.0))
+                    if total_equity > 0:
+                        return total_equity
+                        
+                # 2. Spot/Unified: Equivalent Balance ('eb')
+                equity = float(info.get('eb', 0.0))
+                if equity > 0:
+                     return equity
+                     
+                # 3. Fallback: Total USD
+                return balance.get('total', {}).get('USD', 0.0)
+                
+            except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+                if attempt == 2:
+                     print(f"[{self.name}] ❌ Equity Check Failed after 3 attempts: {e}")
+                     return None # Return None instead of 0.0 to prevent panic
+                time.sleep(1 * (attempt+1))
+        return None
 
     def get_buying_power(self, leverage: float = 5.0) -> float:
         """
         Fetch Effective Buying Power (Equity * Leverage).
         Uses Kraken's 'eb' (Equivalent Balance) or 'tb' (Trade Balance).
         """
-        try:
-            balance = self.exchange.fetch_balance()
-            info = balance.get('info', {})
-            
-            # 1. Try Equivalent Balance (Equity) - Spot/Unified
-            equity = float(info.get('eb', 0.0))
-            
-            # 2. Try Futures 'marginEquity' (Common in Kraken Futures API)
-            if equity <= 0 and config.TRADING_MODE == 'FUTURES':
-                # Handle Kraken Futures 'flex' account structure
-                accounts = info.get('accounts', {})
-                flex = accounts.get('flex', {})
+        for attempt in range(3):
+            try:
+                balance = self.exchange.fetch_balance()
+                info = balance.get('info', {})
                 
-                # Priority: availableMargin (Free to trade) -> marginEquity (Total Net Worth)
-                # We use availableMargin to avoid rejecting orders due to tied up funds
-                avail_margin = float(flex.get('availableMargin', 0.0))
-                margin_equity = float(flex.get('marginEquity', 0.0))
+                # 1. Try Equivalent Balance (Equity) - Spot/Unified
+                equity = float(info.get('eb', 0.0))
                 
-                if avail_margin > 0:
-                    equity = avail_margin
-                    # NOTE: availableMargin is already " Buying Power / Leverage " ? 
-                    # No, usually it's the equity available for initial margin.
-                    # Buying Power = availableMargin * Leverage.
-                elif margin_equity > 0:
-                     equity = margin_equity
+                # 2. Try Futures 'marginEquity' (Common in Kraken Futures API)
+                if equity <= 0 and config.TRADING_MODE == 'FUTURES':
+                    # Handle Kraken Futures 'flex' account structure
+                    accounts = info.get('accounts', {})
+                    flex = accounts.get('flex', {})
+                    
+                    # Priority: availableMargin (Free to trade) -> marginEquity (Total Net Worth)
+                    # We use availableMargin to avoid rejecting orders due to tied up funds
+                    avail_margin = float(flex.get('availableMargin', 0.0))
+                    margin_equity = float(flex.get('marginEquity', 0.0))
+                    
+                    if avail_margin > 0:
+                        equity = avail_margin
+                        # NOTE: availableMargin is already " Buying Power / Leverage " ? 
+                        # No, usually it's the equity available for initial margin.
+                        # Buying Power = availableMargin * Leverage.
+                    elif margin_equity > 0:
+                         equity = margin_equity
+                    else:
+                        # Fallback to total USD if flex is empty (e.g. cash only)
+                        equity = balance.get('total', {}).get('USD', 0.0)
+                    
+                # 3. Fallback to Trade Balance
+                if equity <= 0:
+                    equity = float(info.get('tb', 0.0))
+                    
+                # 4. Fallback to Free Balance
+                if equity <= 0:
+                    return self.get_account_balance()
+                    
+                # Buying Power = Equity * Leverage
+                if config.TRADING_MODE == 'FUTURES':
+                    # For Futures, let's trust the configured leverage cap
+                    return equity * leverage
                 else:
-                    # Fallback to total USD if flex is empty (e.g. cash only)
-                    equity = balance.get('total', {}).get('USD', 0.0)
+                    return equity * leverage
                 
-            # 3. Fallback to Trade Balance
-            if equity <= 0:
-                equity = float(info.get('tb', 0.0))
-                
-            # 4. Fallback to Free Balance
-            if equity <= 0:
-                return self.get_account_balance()
-                
-            # Buying Power = Equity * Leverage
-            if config.TRADING_MODE == 'FUTURES':
-                # For Futures, let's trust the configured leverage cap
-                return equity * leverage
-            else:
-                return equity * leverage
-            
-        except Exception as e:
-            print(f"[{self.name}] ❌ Buying Power Check Failed: {e}")
-            return self.get_account_balance()
+            except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+                if attempt == 2:
+                    print(f"[{self.name}] ❌ Buying Power Check Failed: {e}")
+                    return self.get_account_balance()
+                time.sleep(1 * (attempt+1))
+        return self.get_account_balance()
 
-    def place_limit_order(self, symbol: str, direction: Literal['BUY', 'SELL'], quantity: float, limit_price: float, margin: bool = True, leverage: float = 1.0):
+    def place_order(self, symbol: str, direction: Literal['BUY', 'SELL'], quantity: float, price: float = 0.0, order_type: str = 'limit', margin: bool = True, leverage: float = 1.0, urgent: bool = False, reduce_only: bool = False):
         """
-        Place a limit order (Post-Only) on the exchange.
+        Place an order on the exchange.
+        Supports LIMIT (Maker) and MARKET (Taker) orders.
         
         Args:
             symbol: Internal symbol (e.g. 'BTC/USDT')
             direction: 'BUY' or 'SELL'
             quantity: Amount to buy/sell
-            limit_price: Limit price
+            price: Limit price (ignored if order_type='market')
+            order_type: 'limit' or 'market'
             margin: Whether to use margin (Futures default: True)
-            leverage: Leverage multiplier (e.g., 20.0). Defaults to 1.0 if not specified.
+            leverage: Leverage multiplier.
+            urgent: If True, allows Taker execution (disables PostOnly).
+            reduce_only: If True, order will only reduce position (no new opens).
         """
         exec_symbol = self.symbol_map.get(symbol, symbol)
         side = 'buy' if direction == 'BUY' else 'sell'
+        
+        # --- OPTIMIZATION: Urgent Exits ---
+        if reduce_only:
+            # Force Market Order for Exits (Take Profit / Stop Loss) to ensure fill
+            # and avoid 'postOnly' cancellations on limit orders that cross the spread
+            order_type = 'market'
+            # print(f"[{self.name}] ⚡ URGENT EXIT: Forcing MARKET order for {symbol}")
         
         # Prepare values with correct precision
         try:
@@ -205,7 +263,7 @@ class ActuatorHolon(Holon):
 
             # Convert float to precise string
             qty_str = self.exchange.amount_to_precision(exec_symbol, quantity)
-            price_str = self.exchange.price_to_precision(exec_symbol, limit_price)
+            price_str = self.exchange.price_to_precision(exec_symbol, price)
             
             # Convert back to float/number for create_order if it expects numbers, 
             # BUT ccxt usually handles strings best to avoid float drift. 
@@ -218,16 +276,26 @@ class ActuatorHolon(Holon):
         except Exception as e:
             print(f"[{self.name}] ⚠️ Precision formatting failed: {e}. Using raw values.")
             final_qty = quantity
-            final_price = limit_price
+            final_price = price
 
         # --- LIQUIDITY SANITY CHECK ---
         # Ensure we aren't eating the entire book
-        if not self.check_liquidity(exec_symbol, direction, final_qty, final_price):
-            print(f"[{self.name}] 🛑 LIQUIDITY CHECK FAILED: {exec_symbol} Book too thin for {final_qty}. Order Aborted.")
-            return None
+        # For Market Orders, check if top book density is enough
+        # Patch: If Market Order (price=0), fetch current price for sanity check
+        check_price = final_price
+        if order_type != 'limit' or check_price <= 0:
+            try:
+                ticker = self.exchange.fetch_ticker(exec_symbol)
+                check_price = ticker['last']
+            except:
+                check_price = 0.0
+
+        if not self.check_liquidity(exec_symbol, direction, final_qty, check_price):
+             print(f"[{self.name}] 🛑 LIQUIDITY CHECK FAILED: {exec_symbol} Book too thin for {final_qty}. Order Aborted.")
+             return None
         # ------------------------------
 
-        print(f"[{self.name}] 🚀 PLACING REAL LIMIT {direction} {final_qty} {exec_symbol} @ {final_price} (Lev: {leverage}x)")
+        print(f"[{self.name}] 🚀 PLACING {order_type.upper()} {direction} {final_qty} {exec_symbol} (Lev: {leverage}x, Reduce: {reduce_only})")
         
         try:
             # --- PATCH: SET LEVERAGE ---
@@ -238,36 +306,146 @@ class ActuatorHolon(Holon):
                      print(f"[{self.name}] ⚠️ Set Leverage Failed: {lev_err}")
             # ---------------------------
 
-            params = {'postOnly': True}
+            params = {}
             if margin:
                 # Isolated margin for shorting/leverage
                 params['marginMode'] = 'isolated' 
                 
+            if order_type == 'limit':
+                # Only strictly require PostOnly if NOT urgent
+                if not urgent:
+                    params['postOnly'] = True
+                price_arg = final_price
+            else:
+                # Market Order
+                price_arg = None # ccxt ignores price for market orders usually, or handles it
+            
+            # --- REDUCE ONLY FLAG ---
+            if reduce_only and config.TRADING_MODE == 'FUTURES':
+                 params['reduceOnly'] = True
+            # ------------------------
+            
             order = self.exchange.create_order(
                 symbol=exec_symbol,
-                type='limit',
+                type=order_type,
                 side=side,
                 amount=final_qty, # Use precise value
-                price=final_price, # Use precise value
+                price=price_arg,
                 params=params
             )
             
-            # Map back to our internal structure for tracking
-            internal_order = {
+            order_record = {
                 'id': order['id'],
-                'status': 'OPEN',
                 'symbol': symbol,
                 'direction': direction,
-                'quantity': quantity,
-                'limit_price': limit_price,
-                'timestamp': time.time()
+                'status': 'OPEN',
+                'type': order_type,
+                'entry_time': time.strftime("%H:%M:%S"),
+                'timestamp': time.time(),
+                'quantity': final_qty,
+                'price': final_price if order_type == 'limit' else 0.0 # Will update on fill
             }
-            self.pending_orders.append(internal_order)
-            return internal_order
+            
+            self.pending_orders.append(order_record)
+            print(f"[{self.name}] ✅ Order Placed: {order['id']}")
+            return order['id']
             
         except Exception as e:
-            error_msg = str(e)
-            if "postWouldExecute" in error_msg or "OrderImmediatelyFillable" in error_msg:
+            msg = str(e)
+            print(f"[{self.name}] ❌ Order Placement Failed: {msg}")
+            
+            # GUARD: INSUFFICIENT FUNDS -> DO NOT RETRY IMMEDIATELY
+            if "insufficientAvailableFunds" in msg:
+                 print(f"[{self.name}] 🛑 Insufficient Funds. Order dropped to prevent spam.")
+                 return None
+                 
+            # GUARD: ALREADY CLOSED (Race Condition)
+            if "wouldNotReducePosition" in msg:
+                 print(f"[{self.name}] ℹ️ Position appears already closed/reduced (Exchange Rejected). Skipping.")
+                 return None
+            
+            # RETRY LOGIC (Only for Limit Orders usually, but maybe Market failed?)
+            # If Market order failed, we generally just fail.
+            if order_type == 'market':
+                return None
+
+            # RETRY 1: TAKER RETRY (PostOnly Failed)
+            # If we were trying to be a Maker but the price moved, just TAKE it.
+            if "OrderImmediatelyFillable" in msg or "postOnly" in msg:
+                 try:
+                     print(f"[{self.name}] ⚠️ PostOnly Failed (Price moved). Retrying as TAKER...")
+                     params['postOnly'] = False
+                     
+                     # --- REDUCE ONLY ON RETRY ---
+                     if reduce_only and config.TRADING_MODE == 'FUTURES':
+                          params['reduceOnly'] = True
+                     # ----------------------------
+
+                     order = self.exchange.create_order(
+                        symbol=exec_symbol,
+                        type='limit', # Still limit, but crossing book
+                        side=side,
+                        amount=final_qty,
+                        price=final_price,
+                        params=params
+                     )
+                     # If success, add to pending
+                     order_record = {
+                        'id': order['id'],
+                        'symbol': symbol,
+                        'direction': direction,
+                        'status': 'OPEN',
+                        'type': 'limit', # Original type was limit, now it's a taker limit
+                        'entry_time': time.strftime("%H:%M:%S"),
+                        'timestamp': time.time(),
+                        'quantity': final_qty,
+                        'price': final_price
+                    }
+                     self.pending_orders.append(order_record)
+                     print(f"[{self.name}] ✅ Order Placed (TAKER): {order['id']}")
+                     return order['id']
+                 except Exception as e2:
+                     print(f"[{self.name}] ❌ Taker Retry Failed: {e2}")
+
+            # RETRY 2: REDUCE ONLY (Aggressive Exit Fix)
+            # If we failed due to funds AND we wanted to Reduce (or user logic implied it?), try to force reduceOnly.
+            # Usually if 'reduce_only' was already True, we failed anyway.
+            # But if 'reduce_only' was False, this might be a desperate attempt to 'close' if we messed up direction?
+            # Actually, let's only do this if we suspect it's an exit failing.
+            # For now, if we explicitly passed reduce_only=True, and it failed, we are done.           
+            if "insufficientAvailableFunds" in msg and direction == 'SELL' and not reduce_only:
+                 # Only retry with reduceOnly if we didn't try it yet
+                 try:
+                     print(f"[{self.name}] 🔄 Retrying with reduceOnly=True (Fallback)...")
+                     params['reduceOnly'] = True
+                     order = self.exchange.create_order(
+                        symbol=exec_symbol,
+                        type='limit',
+                        side=side,
+                        amount=final_qty,
+                        price=final_price,
+                        params=params
+                     )
+                     # If success, add to pending
+                     order_record = {
+                        'id': order['id'],
+                        'symbol': symbol,
+                        'direction': direction,
+                        'status': 'OPEN',
+                        'type': 'limit', # Original type was limit
+                        'entry_time': time.strftime("%H:%M:%S"),
+                        'timestamp': time.time(),
+                        'quantity': final_qty,
+                        'price': final_price
+                    }
+                     self.pending_orders.append(order_record)
+                     print(f"[{self.name}] ✅ Retry Successful: {order['id']}")
+                     return order['id']
+                 except Exception as retry_e:
+                     print(f"[{self.name}] ❌ Retry Failed: {retry_e}")
+            
+            # Original logic for postWouldExecute/OrderImmediatelyFillable
+            if "postWouldExecute" in msg or "OrderImmediatelyFillable" in msg:
                 print(f"[{self.name}] ⚠️ Maker Order Rejected (Price crossed spread). Retrying as TAKER...")
                 try:
                     # Retry without Post-Only (Eat the Taker Fee to ensure execution)
@@ -290,7 +468,8 @@ class ActuatorHolon(Holon):
                         'symbol': symbol,
                         'direction': direction,
                         'quantity': quantity,
-                        'limit_price': limit_price,
+                        'price': price, # Use 'price' instead of 'limit_price'
+                        'type': 'limit', # Original type was limit
                         'timestamp': time.time()
                     }
                     self.pending_orders.append(internal_order)
@@ -344,7 +523,6 @@ class ActuatorHolon(Holon):
                     except Exception as e:
                         print(f"[{self.name}] ⚠️ fetch_closed_orders failed: {e}")
                 
-                # 3. Process Result
                 if found_order:
                     remote_status = found_order['status']
                     
@@ -360,23 +538,37 @@ class ActuatorHolon(Holon):
                         
                     elif remote_status == 'canceled':
                         print(f"[{self.name}] ⚠️ Order {order['id']} was CANCELED.")
+                        # Do not add to remaining_orders -> Dropped from tracking
                         
-                    elif remote_status == 'open':
-                        # Still open, check timeout
-                        if time.time() - order['timestamp'] > 300:
-                            self.exchange.cancel_order(order['id'], exec_symbol)
-                            print(f"[{self.name}] ⏱️ Order {order['id']} TIMEOUT. Canceled.")
+                        # Still open, check timeout (55s + jitter)
+                        age = time.time() - order['timestamp']
+                        
+                        # Add jitter to prevent thundering herd on API
+                        timeout = 55 + random.randint(-5, 5)
+                        
+                        if age > timeout:
+                            try:
+                                self.exchange.cancel_order(order['id'], exec_symbol)
+                                print(f"[{self.name}] ⏱️ Order {order['id']} TIMEOUT ({age:.2f}s > {timeout}s). Requesting Cancel to Reprice...")
+                            except Exception as cancel_err:
+                                print(f"[{self.name}] ⚠️ Cancel Failed for {order['id']}: {cancel_err}")
+                            
+                            # CRITICAL: Keep tracking it until verifying it is GONE/CANCELED in next cycle
+                            remaining_orders.append(order)
                         else:
+                            # print(f"[{self.name}] Order {order['id']} Open for {age:.2f}s")
                             remaining_orders.append(order)
                     else:
                         # Unknown status
                         remaining_orders.append(order)
+
                 else:
                     # Order not found in either list? 
-                    # It might be an old order that fell off the list, or API lag.
-                    # Keep watching it for a bit unless it's very old
-                    if time.time() - order['timestamp'] > 600:
-                         print(f"[{self.name}] 👻 Order {order['id']} disappeared. Assuming Canceled/lost.")
+                    # Use Configured GC Timeout for Ghost Orders
+                    ghost_timeout = getattr(config, 'GC_STALE_ORDER_TIMEOUT', 120)
+                    if time.time() - order['timestamp'] > ghost_timeout:
+                         print(f"[{self.name}] 👻 Order {order['id']} Disappeared & Expired (> {ghost_timeout}s). Dropping.")
+                         # Dropped
                     else:
                          remaining_orders.append(order)
 
@@ -415,3 +607,74 @@ class ActuatorHolon(Holon):
         except Exception as e:
             print(f"[{self.name}] ⚠️ Actuator Book Fetch Fail {symbol}: {e}")
             return {'bids': [], 'asks': []}
+
+    def gc_clean_stale_orders(self) -> int:
+        """
+        Garbage Collector: Cancel and remove orders older than GC_STALE_ORDER_TIMEOUT.
+        Returns the count of cleaned orders.
+        """
+        cleaned_count = 0
+        remaining_orders = []
+        stale_timeout = getattr(config, 'GC_STALE_ORDER_TIMEOUT', 120)
+        verbose = getattr(config, 'GC_LOG_VERBOSE', True)
+        
+        for order in self.pending_orders:
+            age = time.time() - order.get('timestamp', time.time())
+            
+            if age > stale_timeout:
+                # Attempt to cancel on exchange
+                try:
+                    exec_symbol = self.symbol_map.get(order['symbol'], order['symbol'])
+                    self.exchange.cancel_order(order['id'], exec_symbol)
+                    if verbose:
+                        print(f"[GC Monitor] 🗑️ Canceled stale order {order['id']} ({order['symbol']}) after {age:.0f}s")
+                except Exception as e:
+                    if verbose:
+                        print(f"[GC Monitor] ⚠️ Failed to cancel {order['id']}: {e}")
+                
+                cleaned_count += 1
+                # Do NOT add to remaining_orders -> dropped
+            else:
+                remaining_orders.append(order)
+        
+        self.pending_orders = remaining_orders
+        
+        if verbose and cleaned_count > 0:
+            print(f"[GC Monitor] ✅ Actuator Cleanup: {cleaned_count} stale orders removed.")
+        
+        return cleaned_count
+
+    def fetch_order_status(self, order_id: str, symbol: str) -> Dict[str, Any]:
+        """
+        Verify the status of a specific order on the exchange.
+        Used by Executor for Hard Gating.
+        """
+        try:
+             # CCXT fetch_order
+             exec_symbol = self.symbol_map.get(symbol, symbol)
+             order = self.exchange.fetch_order(order_id, exec_symbol)
+             return order
+        except Exception as e:
+             # print(f"[{self.name}] ⚠️ Fetch Order Failed: {e}")
+             return None
+
+    def check_invariants(self, balance: float, total_exposure: float) -> bool:
+        """
+        Unified Control Protocol: Invariant Check (Request E)
+        If Implied Leverage > Max Allowed + Buffer -> HALT.
+        Returns False if invariant violated (HALT).
+        """
+        if balance <= 0: return True # Can't calc leverage, assume dead or startup
+        
+        implied_leverage = total_exposure / balance
+        max_allowed_lev = config.MICRO_MAX_LEVERAGE if config.MICRO_CAPITAL_MODE else config.IMMUNE_MAX_LEVERAGE_RATIO
+        
+        # Buffer of +2.0x for temporary volatility swings before Hard Halt
+        limit = max_allowed_lev + 2.0
+        
+        if implied_leverage > limit:
+             print(f"[{self.name}] 🚨 INVARIANT VIOLATION: Implied Leverage {implied_leverage:.2f}x > Max {limit}x ({max_allowed_lev} + 2)")
+             print(f"[{self.name}] 🛑 SYSTEM HALT TRIGGERED: Exposure Mismatch. Manual Intervention Required.")
+             return False # HALT
+             
+        return True

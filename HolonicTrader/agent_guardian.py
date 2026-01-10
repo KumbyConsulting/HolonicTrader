@@ -68,14 +68,26 @@ class ExitGuardianHolon(Holon):
         if pnl_pct >= config.SATELLITE_TAKE_PROFIT_1:
              print(f"[{self.name}] 🚀 SATELLITE HIT & RUN: {symbol} (+{pnl_pct*100:.2f}%) -> TAKING PROFIT")
              self.reset_watermark(symbol)
-             return TradeSignal(symbol=symbol, direction='SELL' if direction == 'BUY' else 'BUY', size=1.0, price=current_price)
+             return TradeSignal(
+                 symbol=symbol, 
+                 direction='SELL' if direction == 'BUY' else 'BUY', 
+                 size=1.0, 
+                 price=current_price,
+                 metadata={'reason': 'TAKE_PROFIT'}
+             )
              
         # 3. Hard Stop (ATR-based, approx 1.5x) or fixed %
         # We use a fixed 2% stop for simplicity if ATR is 0
         if pnl_pct <= -0.02:
              print(f"[{self.name}] 💥 SATELLITE STOP LOSS: {symbol} ({pnl_pct*100:.2f}%)")
              self.reset_watermark(symbol)
-             return TradeSignal(symbol=symbol, direction='SELL' if direction == 'BUY' else 'BUY', size=1.0, price=current_price)
+             return TradeSignal(
+                 symbol=symbol, 
+                 direction='SELL' if direction == 'BUY' else 'BUY', 
+                 size=1.0, 
+                 price=current_price,
+                 metadata={'reason': 'STOP_LOSS'}
+             )
              
         return None
 
@@ -91,7 +103,6 @@ class ExitGuardianHolon(Holon):
         direction: Literal['BUY', 'SELL'] = 'BUY'
     ):
         
-        # --- PHASE 25: SATELLITE ROUTING ---
         if symbol in config.SATELLITE_ASSETS:
             return self.manage_satellite_positions(symbol, current_price, entry_price, direction)
         # -----------------------------------
