@@ -44,3 +44,15 @@ Desktop.ini
 # IDEs
 .vscode/
 .idea/
+
+# Rust
+rust_engine/target/
+*.pyd
+
+# Node
+node_modules/
+dashboard-ui/node_modules/
+dashboard-ui/dist/
+
+# Junk
+*.crdownload

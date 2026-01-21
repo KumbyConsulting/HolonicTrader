@@ -36,6 +36,11 @@ class DatabaseManager:
             c.execute("ALTER TABLE portfolio ADD COLUMN position_metadata TEXT")
         except sqlite3.OperationalError:
             pass # Column likely exists
+            
+        try:
+            c.execute("ALTER TABLE portfolio ADD COLUMN fortress_balance REAL")
+        except sqlite3.OperationalError:
+            pass # Column likely exists
         
         # Ledger Table (The Blockchain)
         c.execute('''
@@ -137,7 +142,7 @@ class DatabaseManager:
         c.execute('''
             SELECT symbol, direction, pnl, pnl_percent, timestamp 
             FROM trades 
-            WHERE pnl IS NOT NULL 
+            WHERE pnl IS NOT NULL AND pnl != 0
             ORDER BY timestamp DESC 
             LIMIT ?
         ''', (limit,))
@@ -148,7 +153,25 @@ class DatabaseManager:
                  'pnl_percent': r[3], 'timestamp': r[4]} 
                 for r in rows]
 
-    def save_portfolio(self, usd: float, held_assets: Dict[str, float], position_metadata: Dict[str, Any]):
+    def get_win_rate(self, limit: int = 50) -> float:
+        """
+        Calculate current win rate for PPO reward signal.
+        Returns: float 0.0 to 1.0
+        """
+        try:
+            trades = self.get_recent_trades(limit)
+            if not trades:
+                return 0.5 # Neutral baseline
+                
+            wins = len([t for t in trades if t['pnl'] > 0])
+            total = len(trades)
+            
+            return wins / total if total > 0 else 0.5
+        except Exception as e:
+            print(f"⚠️ DB Error calculating win rate: {e}")
+            return 0.5
+
+    def save_portfolio(self, usd: float, held_assets: Dict[str, float], position_metadata: Dict[str, Any], fortress_balance: float = 0.0):
         """Save or update the portfolio state with explicit column mapping."""
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
@@ -159,9 +182,9 @@ class DatabaseManager:
         
         # Explicit column names in INSERT to match the actual table schema
         c.execute('''
-        INSERT OR REPLACE INTO portfolio (id, balance_usd, held_assets, position_metadata, updated_at)
-        VALUES (1, ?, ?, ?, ?)
-        ''', (usd, assets_json, meta_json, timestamp))
+        INSERT OR REPLACE INTO portfolio (id, balance_usd, held_assets, position_metadata, fortress_balance, updated_at)
+        VALUES (1, ?, ?, ?, ?, ?)
+        ''', (usd, assets_json, meta_json, fortress_balance, timestamp))
         
         conn.commit()
         conn.close()
@@ -172,7 +195,7 @@ class DatabaseManager:
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
         
-        c.execute('SELECT balance_usd, held_assets, position_metadata FROM portfolio WHERE id = 1')
+        c.execute('SELECT balance_usd, held_assets, position_metadata, fortress_balance FROM portfolio WHERE id = 1')
         row = c.fetchone()
         conn.close()
         
@@ -184,7 +207,8 @@ class DatabaseManager:
             return {
                 'balance_usd': row['balance_usd'], 
                 'held_assets': held_assets,
-                'position_metadata': position_metadata
+                'position_metadata': position_metadata,
+                'fortress_balance': row['fortress_balance'] or 0.0
             }
         return None
 

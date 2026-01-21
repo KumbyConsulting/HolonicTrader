@@ -15,9 +15,10 @@ from HolonicTrader.agent_governor import GovernorHolon
 from HolonicTrader.agent_executor import ExecutorHolon
 from HolonicTrader.agent_actuator import ActuatorHolon
 from HolonicTrader.agent_ppo import PPOHolon
-from HolonicTrader.agent_ppo import PPOHolon
 from HolonicTrader.agent_sentiment import SentimentHolon
 from HolonicTrader.agent_overwatch import OverwatchHolon # <--- NEW: The Sentry
+from HolonicTrader.agent_whale import WhaleHolon # <--- NEW: The Harpoon
+from HolonicTrader.agent_structure import CTKSStrategicHolon # <--- NEW: The Institution
 
 from database_manager import DatabaseManager
 
@@ -76,7 +77,7 @@ class QueueLogger:
         except Exception:
             pass
 
-def main_live(status_queue: Queue = None, stop_event: threading.Event = None, interval_seconds: int = 60, command_queue: Queue = None):
+def main_live(status_queue: Queue = None, stop_event: threading.Event = None, interval_seconds: int = 60, command_queue: Queue = None, disable_telegram: bool = False):
     print("==========================================")
     print("   HOLONIC TRADER - LIVE ENVIRONMENT      ")
     print("==========================================")
@@ -91,63 +92,67 @@ def main_live(status_queue: Queue = None, stop_event: threading.Event = None, in
         return
 
     # 0c. Capital Synchronization (Live & Paper)
-    try:
-        import ccxt
-        print(f">> 🔄 Syncing Capital from Kraken ({config.TRADING_MODE})...")
+    if not config.PAPER_TRADING:
+        try:
+            import ccxt
+            print(f">> 🔄 Syncing Capital from Kraken ({config.TRADING_MODE})...")
         
-        if config.TRADING_MODE == 'FUTURES':
-            exchange_class = ccxt.krakenfutures
-            # Use specific Futures keys if available
-            api_key = config.KRAKEN_FUTURES_API_KEY or config.API_KEY
-            api_secret = config.KRAKEN_FUTURES_PRIVATE_KEY or config.API_SECRET
-        else:
-            exchange_class = ccxt.kraken
-            api_key = config.API_KEY
-            api_secret = config.API_SECRET
+            if config.TRADING_MODE == 'FUTURES':
+                exchange_class = ccxt.krakenfutures
+                # Use specific Futures keys if available
+                api_key = config.KRAKEN_FUTURES_API_KEY or config.API_KEY
+                api_secret = config.KRAKEN_FUTURES_PRIVATE_KEY or config.API_SECRET
+            else:
+                exchange_class = ccxt.kraken
+                api_key = config.API_KEY
+                api_secret = config.API_SECRET
+                
+            exchange = exchange_class({'apiKey': api_key, 'secret': api_secret})
+            bal = exchange.fetch_balance()
+            info = bal.get('info', {})
             
-        exchange = exchange_class({'apiKey': api_key, 'secret': api_secret})
-        bal = exchange.fetch_balance()
-        info = bal.get('info', {})
-        
-        real_equity = 0.0
-        
-        if config.TRADING_MODE == 'FUTURES':
-            # Futures Equity Check (Multi-Collateral 'flex')
-            accounts = info.get('accounts', {})
-            flex = accounts.get('flex', {})
-            real_equity = float(flex.get('marginEquity', 0.0))
+            real_equity = 0.0
             
-            if real_equity <= 0:
-                 # Fallback to cash USD if no margin account
-                 real_equity = bal.get('total', {}).get('USD', 0.0)
-        else:
-            # Spot Equity Check
-            real_equity = float(info.get('eb', 0.0))
-            if real_equity <= 0: real_equity = float(info.get('tb', 0.0))
-            if real_equity <= 0: 
-                 real_equity = bal['free'].get('USD', 0.0) + bal['free'].get('USDT', 0.0)
-        
-        if real_equity > 5.0: # Sanity check
-             print(f">> 💰 SYNC SUCCESS: Real Equity ${real_equity:.2f}")
-             config.INITIAL_CAPITAL = real_equity
-             config.PRINCIPAL = real_equity * 0.80 
-             print(f"   -> Set INITIAL_CAPITAL = ${config.INITIAL_CAPITAL:.2f}")
-             print(f"   -> Set PRINCIPAL (Hard Stop) = ${config.PRINCIPAL:.2f}")
-        else:
-             print(f">> ⚠️ Exchange Balance too low (${real_equity:.2f}), using Config Default (${config.INITIAL_CAPITAL}).")
-
-    except Exception as e:
-        print(f">> ⚠️ Capital Sync Failed: {e}. Using Config Defaults.")
+            if config.TRADING_MODE == 'FUTURES':
+                # Futures Equity Check (Multi-Collateral 'flex')
+                accounts = info.get('accounts', {})
+                flex = accounts.get('flex', {})
+                real_equity = float(flex.get('marginEquity', 0.0))
+                
+                if real_equity <= 0:
+                     # Fallback to cash USD if no margin account
+                     real_equity = bal.get('total', {}).get('USD', 0.0)
+            else:
+                # Spot Equity Check
+                real_equity = float(info.get('eb', 0.0))
+                if real_equity <= 0: real_equity = float(info.get('tb', 0.0))
+                if real_equity <= 0: 
+                     real_equity = bal['free'].get('USD', 0.0) + bal['free'].get('USDT', 0.0)
+            
+            if real_equity > 5.0: # Sanity check
+                 print(f">> 💰 SYNC SUCCESS: Real Equity ${real_equity:.2f}")
+                 config.INITIAL_CAPITAL = real_equity
+                 print(f"   -> Set INITIAL_CAPITAL = ${config.INITIAL_CAPITAL:.2f}")
+            else:
+                 print(f">> ⚠️ Exchange Balance too low (${real_equity:.2f}), using Config Default (${config.INITIAL_CAPITAL}).")
+    
+        except Exception as e:
+            print(f">> ⚠️ Capital Sync Failed: {e}. Using Config Defaults.")
 
     
+    from HolonicTrader.agent_topology import TopologyHolon # <--- NEW: Structure Brain
+
     # 1. Instantiate Core Agents
     observer = ObserverHolon(exchange_id='kucoin')
     entropy = EntropyHolon()
+    topology = TopologyHolon() # <--- AEHML 2.0
     oracle = EntryOracleHolon()
     guardian = ExitGuardianHolon()
-    monitor = MonitorHolon(principal=config.INITIAL_CAPITAL)
+    monitor = MonitorHolon(principal=config.PRINCIPAL)
     ppo = PPOHolon()
-    sentiment = SentimentHolon() # <--- NEW
+    sentiment = SentimentHolon() 
+    whale = WhaleHolon() 
+    structure = CTKSStrategicHolon() 
     
     # 2. Instantiate Execution Stack
     governor = GovernorHolon(initial_balance=config.INITIAL_CAPITAL, db_manager=db)
@@ -168,12 +173,31 @@ def main_live(status_queue: Queue = None, stop_event: threading.Event = None, in
     )
     
     # 2b. Sync Governor & Exchange
-    executor.reconcile_exchange_positions() # Pull Ghost Positions first
-    executor.sync_balance(config.INITIAL_CAPITAL) # <--- FIX: Force Executor to respect Real Equity
+    executor.reconcile_exchange_positions() 
+    
+    # --- OPTIMIZED BALANCE SYNC (Phase 16) ---
+    if actuator:
+        # Try to get live balance from exchange
+        live_bal = actuator.get_account_balance()
+        if live_bal and live_bal > 0:
+            executor.sync_balance(live_bal)
+        else:
+            # Fallback to DB state
+            executor.sync_balance(executor.balance_usd)
+    else:
+        # Paper Trading: Trust the DB (restored in executor.__init__) over hardcoded config
+        executor.sync_balance(executor.balance_usd)
+    # -----------------------------------------
+
     governor.sync_positions(executor.held_assets, executor.position_metadata)
 
     # 2c. Overwatch (The Sentry: Telegram + NLP)
-    overwatch = OverwatchHolon()
+    overwatch = None
+    if not disable_telegram:
+        try:
+            overwatch = OverwatchHolon()
+        except:
+            print(">> [Warning] Overwatch failed to start. Telegram disabled.")
     
     # 2d. Regime Controller (Phase 7: Capital Regime Management)
     from HolonicTrader.agent_regime import RegimeController
@@ -184,6 +208,7 @@ def main_live(status_queue: Queue = None, stop_event: threading.Event = None, in
     trader = TraderHolon("TraderNexus", sub_holons={
         'observer': observer,
         'entropy': entropy,
+        'topology': topology, # <--- Added to Nexus
         'oracle': oracle,
         'guardian': guardian,
         'monitor': monitor,
@@ -191,8 +216,10 @@ def main_live(status_queue: Queue = None, stop_event: threading.Event = None, in
         'executor': executor,
         'ppo': ppo,
         'sentiment': sentiment,
-        'overwatch': overwatch, # <--- The Sentry
-        'regime': regime_controller  # <--- Phase 7: Regime Controller
+        'overwatch': overwatch,
+        'regime': regime_controller,
+        'whale': whale,
+        'structure': structure 
     })
 
     trader_ref_linked = False
@@ -225,14 +252,22 @@ def main_live(status_queue: Queue = None, stop_event: threading.Event = None, in
             if overwatch:
                 overwatch.stop()
         except Exception:
-            pass
+             pass
+             
+        # Explicit State Save
+        try:
+             if 'executor' in locals() and executor:
+                 executor.save_state()
+        except Exception as e:
+             print(f"Error saving state: {e}")
+
         try:
             db.close()
         except Exception:
             pass
         print(">> SYSTEM SHUTDOWN COMPLETE.")
 
-def run_bot(stop_event, status_queue, config_dict=None, command_queue=None):
+def run_bot(stop_event, status_queue, config_dict=None, command_queue=None, disable_telegram=False):
     """Wrapper for GUI Thread"""
     # Setup Logger
     log_file = f"live_trading_session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -265,7 +300,7 @@ def run_bot(stop_event, status_queue, config_dict=None, command_queue=None):
             
         # 1. Start Loop (Check if GUI provided a specific interval, else default to 60)
         interval = config_dict.get('loop_interval', 60) if config_dict else 60
-        main_live(status_queue, stop_event, interval_seconds=interval, command_queue=command_queue)
+        main_live(status_queue, stop_event, interval_seconds=interval, command_queue=command_queue, disable_telegram=disable_telegram)
     except Exception as e:
         print(f"Bot Crashed: {e}")
 

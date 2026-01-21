@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AEHML TRADER // PHASE IV</title>
+    <!-- Bootstrap 5 CDN -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- Font Awesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <!-- Google Fonts -->
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Orbitron:wght@400;900&family=Inter:wght@300;400;600&display=swap"
+        rel="stylesheet">
+    <!-- Custom Style -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+
+<body class="d-flex flex-column h-100">
+
+    <!-- Header -->
+    <nav class="navbar navbar-expand-lg navbar-dark border-bottom border-secondary mb-4"
+        style="background: var(--bg-card);">
+        <div class="container-fluid">
+            <a class="navbar-brand brand-font gradient-text" href="#">
+                <i class="fa-solid fa-layer-group text-primary me-2"></i>AEHML <span
+                    style="color:var(--accent-cyan)">IV</span>
+            </a>
+
+            <div class="d-flex align-items-center ms-auto">
+                <div class="me-4 d-flex align-items-center">
+                    <span class="text-dim me-2">STATUS:</span>
+                    <span id="sys-status-badge" class="badge bg-danger">STOPPED</span>
+                </div>
+                <div class="me-4 d-flex align-items-center">
+                    <span class="text-dim me-2">REGIME:</span>
+                    <span id="sys-regime" class="mono-font fw-bold" style="color: var(--accent-cyan)">UNKNOWN</span>
+                </div>
+                <div class="d-flex align-items-center">
+                    <span class="text-dim me-2">EQUITY:</span>
+                    <span id="sys-equity" class="brand-font fs-5 text-white">$0.00</span>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <div class="dashboard-container flex-grow-1">
+
+        <!-- Top Row: Controls & Stats -->
+        <div class="row g-4 mb-4">
+            <!-- Left: Controls -->
+            <div class="col-lg-4">
+                <div class="glass-card p-4 h-100 fade-in-up">
+                    <h5 class="brand-font text-dim mb-4"><i class="fa-solid fa-sliders me-2"></i>Command Center</h5>
+
+                    <div class="row g-3 mb-4">
+                        <div class="col-6">
+                            <label class="form-label text-dim">Allocation</label>
+                            <input type="number" id="cfg-alloc" class="form-control bg-dark text-white border-secondary"
+                                value="0.1" step="0.05">
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label text-dim">Leverage</label>
+                            <input type="number" id="cfg-lev" class="form-control bg-dark text-white border-secondary"
+                                value="1.0" step="0.5">
+                        </div>
+                        <div class="col-12">
+                            <label class="form-label text-dim">Target Asset</label>
+                            <select id="cfg-sym" class="form-select bg-dark text-white border-secondary">
+                                <option value="BTC/USDT">BTC/USDT</option>
+                                <option value="ETH/USDT">ETH/USDT</option>
+                                <option value="SOL/USDT">SOL/USDT</option>
+                                <option value="XRP/USDT">XRP/USDT</option>
+                                <option value="ADA/USDT">ADA/USDT</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="d-flex gap-2">
+                        <button id="btn-start" class="btn btn-neon flex-grow-1" onclick="sendCmd('start')"><i
+                                class="fa-solid fa-play me-2"></i>INITIATE</button>
+                        <button id="btn-stop" class="btn btn-neon flex-grow-1" onclick="sendCmd('stop')"
+                            style="border-color: var(--accent-yellow); color: var(--accent-yellow);"><i
+                                class="fa-solid fa-stop me-2"></i>HALT</button>
+                    </div>
+                    <button class="btn btn-panic w-100 mt-3" onclick="sendCmd('panic')"><i
+                            class="fa-solid fa-skull-crossbones me-2"></i>EMERGENCY CLOSE</button>
+                </div>
+            </div>
+
+            <!-- Right: Health & Radar -->
+            <div class="col-lg-8">
+                <!-- Equity Chart (New) -->
+                <div class="glass-card p-4 mb-4 fade-in-up delay-1">
+                    <h5 class="brand-font text-dim mb-3"><i class="fa-solid fa-chart-line me-2"></i>Performance Curve
+                    </h5>
+                    <div style="height: 200px;">
+                        <canvas id="equityChart"></canvas>
+                    </div>
+                </div>
+
+                <div class="glass-card p-4 h-100 fade-in-up delay-1">
+                    <div class="d-flex justify-content-between align-items-center mb-3">
+                        <h5 class="brand-font text-dim"><i class="fa-solid fa-radar me-2"></i>Market Radar</h5>
+                        <div class="d-flex gap-3 text-small">
+                            <span class="text-dim"><i class="fa-solid fa-heart-pulse me-1 text-success"></i>Health:
+                                <span id="sys-health" class="text-white">0.0</span></span>
+                            <span class="text-dim"><i class="fa-solid fa-trophy me-1 text-warning"></i>WinRate: <span
+                                    id="sys-winrate" class="text-white">0%</span></span>
+                        </div>
+                    </div>
+
+                    <div class="table-responsive">
+                        <table class="table table-dark table-hover mb-0">
+                            <thead>
+                                <tr>
+                                    <th>Rank</th>
+                                    <th>Asset</th>
+                                    <th>Score</th>
+                                    <th>Structure</th>
+                                    <th>Status</th>
+                                </tr>
+                            </thead>
+                            <tbody id="radar-table-body">
+                                <tr>
+                                    <td colspan="5" class="text-center text-dim py-3">Scanning Market...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- Middle Row: Positions -->
+        <div class="row mb-4 fade-in-up delay-2">
+            <div class="col-12">
+                <div class="glass-card p-4">
+                    <h5 class="brand-font text-dim mb-3"><i class="fa-solid fa-box-open me-2"></i>Active Portfolio</h5>
+                    <div class="table-responsive">
+                        <table class="table table-dark align-middle">
+                            <thead>
+                                <tr>
+                                    <th>Symbol</th>
+                                    <th>Side</th>
+                                    <th>Size</th>
+                                    <th>Entry</th>
+                                    <th>Mark</th>
+                                    <th>PnL %</th>
+                                    <th>Value</th>
+                                </tr>
+                            </thead>
+                            <tbody id="position-table-body">
+                                <tr>
+                                    <td colspan="7" class="text-center text-dim py-4">No active positions.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Bottom Row: Logs -->
+        <div class="row fade-in-up delay-3">
+            <div class="col-12">
+                <h5 class="brand-font text-dim mb-2"><i class="fa-solid fa-terminal me-2"></i>System Stream</h5>
+                <div class="terminal-window" id="log-window">
+                    <div class="log-entry">System Initialized... Waiting for connection.</div>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Scripts -->
+    <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+</body>
+
+</html>

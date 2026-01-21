@@ -10,12 +10,15 @@ Specialized in:
 from typing import Any, Optional, Literal
 from HolonicTrader.holon_core import Holon, Disposition
 import config
+import os
+import json
 
 class ExitGuardianHolon(Holon):
     def __init__(self, name: str = "ExitGuardian"):
         super().__init__(name=name, disposition=Disposition(autonomy=0.8, integration=0.4))
         self.last_exit_times = {} # {symbol: timestamp}
         self.trade_watermarks = {} # {symbol: {high: float, low: float}}
+        self.partial_exits = {} # {symbol: True} if scalp taken
 
     def update_watermark(self, symbol: str, current_price: float, entry_price: float = None):
         """Update the High/Low watermark for true trailing."""
@@ -33,6 +36,19 @@ class ExitGuardianHolon(Holon):
     def reset_watermark(self, symbol: str):
          if symbol in self.trade_watermarks:
              del self.trade_watermarks[symbol]
+         if symbol in self.partial_exits:
+             del self.partial_exits[symbol]
+
+    def _load_genome(self):
+        """Load the latest evolved parameters from disk."""
+        try:
+            path = os.path.join(os.getcwd(), 'live_genome.json')
+            if os.path.exists(path):
+                with open(path, 'r') as f:
+                     return json.load(f)
+        except Exception:
+            pass # Silent fail is fine, use defaults
+        return None
 
     def manage_satellite_positions(self, symbol: str, current_price: float, entry_price: float, direction: Literal['BUY', 'SELL']):
         """
@@ -56,39 +72,39 @@ class ExitGuardianHolon(Holon):
         # Logic: If we are > 1.5% profit, we assume the actuator moves the SL.
         # But here, we simulate the "Close" if price drops back.
         # Ideally, actuator handles hard stops. Guardian handles 'decisions'.
-        # For simplicity in this Phase 4 architecture:
-        # If PnL was high (>1.5%) and now drops to <= 0.1%, we exit.
-        # But we don't store "high watermark" here yet. 
-        # So we will implement the TP logic first.
+
+        pnl_pct = (current_price - entry_price) / entry_price if direction == 'BUY' else (entry_price - current_price) / entry_price
         
-        # 2. Take Profit (Scale Out 50%)
-        # Note: Phase 4 Executor doesn't support partial closes well yet (binary ON/OFF per signal).
-        # We will trigger a 'REDUCE' signal (which Executor treats as Exit for now, or we implement partials later).
-        # For now, we take FULL PROFIT at 3% to be safe and simple.
-        if pnl_pct >= config.SATELLITE_TAKE_PROFIT_1:
-             print(f"[{self.name}] 🚀 SATELLITE HIT & RUN: {symbol} (+{pnl_pct*100:.2f}%) -> TAKING PROFIT")
-             self.reset_watermark(symbol)
-             return TradeSignal(
-                 symbol=symbol, 
-                 direction='SELL' if direction == 'BUY' else 'BUY', 
-                 size=1.0, 
-                 price=current_price,
-                 metadata={'reason': 'TAKE_PROFIT'}
-             )
+        # Load Config
+        genome = self._load_genome()
+        if genome:
+             stop_limit = genome.get('satellite_stop_loss', config.SATELLITE_STOP_LOSS)
+             tp_target = genome.get('satellite_take_profit', config.SATELLITE_TAKE_PROFIT_1)
+        else:
+             stop_limit = config.SATELLITE_STOP_LOSS
+             tp_target = config.SATELLITE_TAKE_PROFIT_1
              
-        # 3. Hard Stop (ATR-based, approx 1.5x) or fixed %
-        # We use a fixed 2% stop for simplicity if ATR is 0
-        if pnl_pct <= -0.02:
-             print(f"[{self.name}] 💥 SATELLITE STOP LOSS: {symbol} ({pnl_pct*100:.2f}%)")
+        # 1. Take Profit (Sniper Moonshot)
+        if pnl_pct >= tp_target:
+             print(f"[{self.name}] 🎯 SATELLITE SNIPER HIT: {symbol} (+{pnl_pct*100:.2f}%)")
              self.reset_watermark(symbol)
-             return TradeSignal(
-                 symbol=symbol, 
-                 direction='SELL' if direction == 'BUY' else 'BUY', 
-                 size=1.0, 
-                 price=current_price,
-                 metadata={'reason': 'STOP_LOSS'}
-             )
+             return TradeSignal(symbol=symbol, direction='SELL' if direction == 'BUY' else 'BUY', size=1.0, price=current_price, metadata={'reason': 'SATELLITE_TP'})
+
+        # 2. Breakeven (Safety) - Static for now, or could evolve
+        # be_trigger = config.SATELLITE_BREAKEVEN_TRIGGER
+        # ... logic for BE is complex state, keeping simple for now ...
              
+        # 3. Hard Stop (Genome Evolved)
+        # Note: stop_limit is positive number (e.g. 0.05), so we check <= -0.05
+        if pnl_pct <= -stop_limit:
+             print(f"[{self.name}] 💥 SATELLITE STOP LOSS (EVO): {symbol} ({pnl_pct*100:.2f}%)")
+             self.reset_watermark(symbol)
+             return TradeSignal(symbol=symbol, direction='SELL' if direction == 'BUY' else 'BUY', size=1.0, price=current_price, metadata={'reason': 'SATELLITE_SL'})
+             
+        # 4. RSI Exit? (Optional, if in genome)
+        # genome['rsi_sell'] check would require passing Indicators to Guardian.
+        # For now, we rely on PnL exits mainly for robustness.
+        
         return None
 
     def analyze_for_exit(
@@ -100,7 +116,8 @@ class ExitGuardianHolon(Holon):
         atr: float,
         metabolism_state: Literal['SCAVENGER', 'PREDATOR'],
         position_age_hours: float = 0.0,
-        direction: Literal['BUY', 'SELL'] = 'BUY'
+        direction: Literal['BUY', 'SELL'] = 'BUY',
+        regime: str = 'MICRO'
     ):
         
         if symbol in config.SATELLITE_ASSETS:
@@ -120,6 +137,36 @@ class ExitGuardianHolon(Holon):
             pnl_pct = (current_price - entry_price) / entry_price
         else: # SELL (Short)
             pnl_pct = (entry_price - current_price) / entry_price
+            
+        # --- VOL-WINDOW EXIT LOGIC ---
+        if regime == 'VOL_WINDOW':
+            # Tighter trailing stop: 1.5 ATR (High Turnover)
+            if atr > 0:
+                watermark = self.trade_watermarks.get(symbol, {'high': current_price, 'low': current_price})
+                trail_dist = atr * 1.5 
+                
+                if direction == 'BUY':
+                    stop_price = watermark['high'] - trail_dist
+                    if current_price <= stop_price:
+                         print(f"[{self.name}] ⚡ VOL_WINDOW TRAIL HIT: {symbol} @ {current_price:.4f} (High {watermark['high']:.4f})")
+                         self.reset_watermark(symbol)
+                         return TradeSignal(symbol=symbol, direction='SELL', size=1.0, price=current_price, metadata={'reason': 'VOL_TRAIL'})
+                else: # SELL
+                    stop_price = watermark['low'] + trail_dist
+                    if current_price >= stop_price:
+                         print(f"[{self.name}] ⚡ VOL_WINDOW TRAIL HIT: {symbol} @ {current_price:.4f} (Low {watermark['low']:.4f})")
+                         self.reset_watermark(symbol)
+                         return TradeSignal(symbol=symbol, direction='BUY', size=1.0, price=current_price, metadata={'reason': 'VOL_TRAIL'})
+            
+            # Hard Stop (1%)
+            if pnl_pct <= -0.01:
+                 print(f"[{self.name}] ⚡ VOL_WINDOW HARD STOP: {symbol} ({pnl_pct*100:.2f}%)")
+                 self.reset_watermark(symbol)
+                 return TradeSignal(symbol=symbol, direction='SELL' if direction == 'BUY' else 'BUY', size=1.0, price=current_price, metadata={'reason': 'VOL_STOP'})
+                 
+            return None # Skip standard logic
+        # -----------------------------
+
         
         # 1. HARD STOP LOSS (Circuit Breaker)
         sl_target = config.SCAVENGER_STOP_LOSS if metabolism_state == 'SCAVENGER' else config.PREDATOR_STOP_LOSS
@@ -130,15 +177,20 @@ class ExitGuardianHolon(Holon):
 
         if metabolism_state == 'SCAVENGER':
             # Scavenger Exits: Quick Mean Reversion
-            if position_age_hours >= 4.0:
-                print(f"[{self.name}] ⏳ TIME EXIT: {symbol} (4h reached)")
+            if position_age_hours >= 12.0:
+                print(f"[{self.name}] ⏳ TIME EXIT: {symbol} (12h reached)")
                 self.reset_watermark(symbol)
                 return TradeSignal(symbol=symbol, direction='SELL' if direction == 'BUY' else 'BUY', size=1.0, price=current_price)
             
             if pnl_pct >= config.SCAVENGER_SCALP_TP:
-                print(f"[{self.name}] ✅ SCALP TP: {symbol} (+{pnl_pct*100:.2f}%)")
-                self.reset_watermark(symbol)
-                return TradeSignal(symbol=symbol, direction='SELL' if direction == 'BUY' else 'BUY', size=1.0, price=current_price)
+                if not self.partial_exits.get(symbol, False):
+                    print(f"[{self.name}] 💰 SCALP-TO-PYRAMID: {symbol} (+{pnl_pct*100:.2f}%) -> Banking 50% House Money")
+                    self.partial_exits[symbol] = True
+                    # Do NOT reset watermark - let the runner trail
+                    return TradeSignal(symbol=symbol, direction='SELL' if direction == 'BUY' else 'BUY', size=0.5, price=current_price, metadata={'reason': 'PARTIAL_TP'})
+                else:
+                    # Already scalped - Let it ride! (Handled by Trailing Stop or Time Exit)
+                    pass
                 
             # Mean Reversion: Hit BB Middle
             if direction == 'BUY' and current_price >= bb['middle']:
@@ -152,8 +204,8 @@ class ExitGuardianHolon(Holon):
 
         else: # PREDATOR
             # Predator Exits: Momentum Following
-            if position_age_hours >= 8.0:
-                print(f"[{self.name}] ⏳ TREND EXPIRY: {symbol} (8h reached)")
+            if position_age_hours >= 24.0:
+                print(f"[{self.name}] ⏳ TREND EXPIRY: {symbol} (24h reached)")
                 self.reset_watermark(symbol)
                 return TradeSignal(symbol=symbol, direction='SELL' if direction == 'BUY' else 'BUY', size=1.0, price=current_price)
                 

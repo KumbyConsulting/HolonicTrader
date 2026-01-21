@@ -9,15 +9,22 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from HolonicTrader.holon_core import Holon, Disposition, Message
 
 import requests
+import random
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 import config
+
+import threading
 
 class ObserverHolon(Holon):
     """
     ObserverHolon is responsible for acquiring market data from exchanges
     and processing it for other agents (like the Entropy Agent).
     """
+
+    # Class-Level Shared Cache to prevent redundant Disk I/O across instances
+    _shared_cache = {} 
+    _shared_cache_lock = threading.Lock() # Ensure thread safety
 
     def __init__(self, exchange_id: str = 'kucoin', symbol: str = 'BTC/USDT'):
         # Initialize with default highly autonomous and integrated disposition for now
@@ -49,8 +56,8 @@ class ObserverHolon(Holon):
         # Map for local history files
         self.data_dir = os.path.join(os.getcwd(), 'market_data')
         
-        # Data Cache
-        self._cache = {} # symbol -> DataFrame
+        # Data Cache (Instance level alias to shared?)
+        # self._cache = {} # Legacy instance cache
         self._ticker_cache = {}
         self._last_ticker_fetch = 0.0
 
@@ -88,37 +95,23 @@ class ObserverHolon(Holon):
                 time.sleep(1 * (attempt + 1))
         return {}
 
-    def _get_local_filename(self, symbol: str, timeframe: str = '1h') -> str:
-        """Map symbol to its local CSV filename (Supports 1h and 15m)."""
-        suffix = f"_{timeframe}"
-        
-        # 1. Cleaner Logic: Construct filename directly first
-        clean_symbol = symbol.replace('/', '').replace(':', '')
-        filename = f"{clean_symbol}{suffix}.csv"
-        filepath = os.path.join(self.data_dir, filename)
-        
-        # 2. Check if file exists. If so, return it.
-        if os.path.exists(filepath):
-            return filepath
-            
-        # 3. Legacy Fallback (for 1h files named 'BTCUSD_1h.csv' instead of 'BTCUSDT_1h.csv')
-        # Only needed if direct construction failed
-        legacy_map = {
-            'BTC/USDT': f'BTCUSD{suffix}.csv',
-            'BTC/USD': f'BTCUSD{suffix}.csv',
-        }
-        
-        legacy_name = legacy_map.get(symbol)
-        if legacy_name:
-             return os.path.join(self.data_dir, legacy_name)
-             
-        return filepath # Return built path anyway so we know what was expected
+    def _get_local_filename(self, symbol: str, timeframe: str) -> str:
+        """Constructs the standard filename for local data."""
+        # Sanitize symbol
+        safe_symbol = str(symbol).replace('/', '').replace(':', '')
+        filename = f"{safe_symbol}_{timeframe}.csv"
+        return os.path.join(self.data_dir, filename)
 
     def load_local_history(self, symbol: str, timeframe: str = '1h') -> pd.DataFrame:
         """Load historical data from market_data directory (Cached)."""
         cache_key = f"{symbol}_{timeframe}"
-        if cache_key in self._cache:
-            return self._cache[cache_key]
+        
+        # 1. Check Class-Level Shared Cache (Process Memory)
+        with self._shared_cache_lock:
+             if cache_key in self._shared_cache:
+                 # Check simple expiry? For local history, we assume it's static for the session unless explicitly reloaded.
+                 # Optimization: Return copy? No, read-only is fine for speed.
+                 return self._shared_cache[cache_key].copy() # Copy to prevent mutation issues downstream
 
         filepath = self._get_local_filename(symbol, timeframe)
         
@@ -128,7 +121,11 @@ class ObserverHolon(Holon):
             
         print(f"[{self.name}] Loading local history for {symbol} from {filepath} (DISK READ)")
         df = self.load_data_from_csv(filepath)
-        self._cache[cache_key] = df
+        
+        # 2. Populate Shared Cache
+        with self._shared_cache_lock:
+             self._shared_cache[cache_key] = df
+        
         return df
 
     def fetch_market_data(self, timeframe: str = None, limit: int = 500, symbol: str = None) -> pd.DataFrame:
@@ -137,6 +134,10 @@ class ObserverHolon(Holon):
         """
         target_timeframe = timeframe if timeframe else config.TIMEFRAME
         target_symbol = symbol if symbol else self.symbol
+
+        # PATCH: Apply Kraken Symbol Map for Futures/Spot
+        if config.TRADING_MODE == 'FUTURES' and 'kucoin' not in self.exchange.id:
+             target_symbol = config.KRAKEN_SYMBOL_MAP.get(target_symbol, target_symbol)
         
         # 1. Load Local History
         df_local = self.load_local_history(target_symbol, target_timeframe)
@@ -180,13 +181,16 @@ class ObserverHolon(Holon):
                 break # Success
 
             except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as e:
-                print(f"[{self.name}] ⏳ RATE LIMIT HIT for {target_symbol}. Cooling down 5s...")
-                time.sleep(5) # Smart Backoff
-                if attempt == 2: print(f"[{self.name}] ❌ Max Retries (Rate Limit) for {target_symbol}")
+                # print(f"[{self.name}] ⏳ RATE LIMIT HIT for {target_symbol}. Cooling down...")
+                cool = getattr(config, 'API_RATE_LIMIT_COOL', 10.0)
+                time.sleep(random.uniform(cool * 0.5, cool)) # Randomized Backoff
+                if attempt == 4: print(f"[{self.name}] ❌ Max Retries (Rate Limit) for {target_symbol}")
 
             except Exception as e:
-                print(f"[{self.name}] Sync Attempt {attempt+1}/3 failed for {target_symbol}: {e}")
-                time.sleep(2) # Standard Backoff
+                print(f"[{self.name}] Sync Attempt {attempt+1}/5 failed for {target_symbol}: {e}")
+                j_min = getattr(config, 'API_RETRY_JITTER_MIN', 1.0)
+                j_max = getattr(config, 'API_RETRY_JITTER_MAX', 5.0)
+                time.sleep(random.uniform(j_min, j_max)) # Jittered Backoff
         
         try:
             # Combine
@@ -286,6 +290,44 @@ class ObserverHolon(Holon):
                 time.sleep(1 * (attempt + 1))
         return {'bids': [], 'asks': []}
 
+    def fetch_recent_trades(self, symbol: str, limit: int = 500) -> List[Dict]:
+        """
+        Fetch recent executions (Tick Data) for Order Flow Analysis.
+        Includes a 15s TTL Cache to protect API limits.
+        Returns: [{'price': float, 'amount': float, 'side': 'buy'/'sell', 'timestamp': int}, ...]
+        """
+        # 1. Check Cache
+        now = time.time()
+        if not hasattr(self, '_trades_cache'): self._trades_cache = {}
+        
+        cache_key = f"{symbol}_{limit}"
+        if cache_key in self._trades_cache:
+            entry = self._trades_cache[cache_key]
+            if now - entry['ts'] < 15.0: # 15s TTL
+                return entry['data']
+                
+        # 2. Fetch Live
+        for attempt in range(3):
+            try:
+                # Map symbol if needed
+                req_symbol = symbol
+                if config.TRADING_MODE == 'FUTURES' and 'kucoin' not in self.exchange.id:
+                     req_symbol = config.KRAKEN_SYMBOL_MAP.get(symbol, symbol)
+                
+                if self.exchange.has['fetchTrades']:
+                    trades = self.exchange.fetch_trades(req_symbol, limit=limit)
+                    # Cache result
+                    self._trades_cache[cache_key] = {'data': trades, 'ts': now}
+                    return trades
+                else:
+                    return []
+            except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+                if attempt == 2:
+                    print(f"[{self.name}] ⚠️ Trade Fetch Fail {symbol}: {e}")
+                    return []
+                time.sleep(1 * (attempt + 1))
+        return []
+
     def fetch_funding_rate(self, symbol: str) -> float:
         """
         Fetch Current Funding Rate for a symbol.
@@ -379,3 +421,54 @@ class ObserverHolon(Holon):
         except Exception as e:
             print(f"[{self.name}] Error loading CSV: {e}")
             return pd.DataFrame()
+
+    # === VOL-WINDOW HELPERS ===
+    def fetch_realized_vol(self, symbol: str, window_hours: int = 24) -> float:
+        """
+        Calculate realized volatility (annualized) for the given window.
+        """
+        try:
+            # Fetch 15m candles enough to cover window
+            limit = int((window_hours * 60) / 15) + 20 # Buffer
+            df = self.fetch_market_data(timeframe='15m', limit=limit, symbol=symbol)
+            if df.empty or 'returns' not in df.columns:
+                return 0.0
+            
+            # Std Dev of log returns
+            std_dev = df['returns'].iloc[-limit:].std()
+            
+            # Annualize (assuming 15m candles)
+            # Crypto trades 24/7/365. 
+            # 15m periods per year = 4 * 24 * 365 = 35040
+            annualized_vol = std_dev * np.sqrt(35040)
+            
+            return float(annualized_vol)
+        except Exception as e:
+            print(f"[{self.name}] ⚠️ Vol Calc Failed for {symbol}: {e}")
+            return 0.0
+
+    def fetch_listing_age(self, symbol: str) -> float:
+        """
+        Estimate listing age in days. 
+        Uses first available candle timestamp from exchange or local history.
+        """
+        try:
+            # Try getting earliest candle via CCXT (if supported)
+            # or rely on local history start
+             # 1. Check Local
+            df_local = self.load_local_history(symbol, '1h')
+            local_start = df_local['timestamp'].iloc[0] if not df_local.empty else datetime.now()
+            
+            # 2. If we really need accuracy, we'd query exchange "since 2010" limit 1
+            # For now, we return a heuristic or assume older if local history is deep.
+            
+            # Simple heuristic: If we have > 14 days of local history, it's > 14 days old.
+            age = (datetime.now() - local_start).total_seconds() / 86400.0
+            return age
+        except Exception:
+            return 0.0 # Safer to assume brand new? Or old? 
+                       # Strategy needs < 14 days for meme listing.
+                       # If we return 0.0, we might falsely trigger "New Listing".
+                       # Let's return 999.0 (Old) on failure to be safe.
+            return 999.0
+

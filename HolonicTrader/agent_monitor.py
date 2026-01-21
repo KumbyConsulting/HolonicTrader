@@ -138,15 +138,66 @@ class MonitorHolon(Holon):
         """
         if not self.is_system_healthy:
             return False, "System Unhealthy (Previous Trigger)"
-            
-        # Check Daily Drawdown (using cached state)
-        if hasattr(self, 'daily_start_balance') and self.daily_start_balance > 0:
-            # We need current balance access. If not available, use last known metrics?
-            # Ideally we pass current balance. But for the Kill Switch at start of loop, we might not have it.
-            # Reliance on internal state 'is_system_healthy' set by previous update_health call is safest.
-            pass
-            
         return self.is_system_healthy, "OK"
+
+    def perform_live_check(self, current_equity: float) -> tuple[bool, str]:
+        """
+        IMMEDIATE Health Check using fresh equity data.
+        Call this at the START of the loop.
+        """
+        if current_equity <= 0:
+            return True, "Equity Zero/Unknown" # Fail Open if data missing? Or Fail Closed? Fail Open for now.
+            
+        # 1. Sync Daily Start if needed (e.g. first run of the day/process)
+        import time
+        current_time = time.time()
+        
+        # If we just started and have a saved balance, we use it. 
+        # But if the day rolled over while we were offline, we must handle it.
+        # Simple heuristic: If last_day_reset is old (> 24h), reset now.
+        if self.last_day_reset is None or (current_time - self.last_day_reset > 86400):
+             print(f"[{self.name}] 🌅 STARTUP/ROLLOVER: Setting Day Start Balance to ${current_equity:.2f}")
+             self.daily_start_balance = current_equity
+             self.last_day_reset = current_time
+             self.daily_start_balance = current_equity
+             self.last_day_reset = current_time
+             self._save_state()
+        
+        # 1b. Stale State Detection (Fix for "Health Lockdown" on Restart)
+        # If the persisted daily_start_balance is significantly higher than current equity (e.g. > 5% diff)
+        # AND we are in the first minute of execution (heuristic), assume the file is stale.
+        # We can't easily check "uptime" here, but we can check if we are already in generic 'Lockdown'.
+        # Better heuristic: If daily_dd > 5% but we just started, trust the Exchange over the Disk.
+        daily_dd_raw = (self.daily_start_balance - current_equity) / self.daily_start_balance
+        if daily_dd_raw > 0.05 and not hasattr(self, '_stale_check_done'):
+             print(f"[{self.name}] 🌅 STALE STATE DETECTED: Disk Balance ${self.daily_start_balance:.2f} >> Live ${current_equity:.2f}")
+             print(f"[{self.name}]    -> Forcing Day Reset to Live Equity to clear false fever.")
+             self.daily_start_balance = current_equity
+             self.last_day_reset = current_time
+             self._save_state()
+             self._stale_check_done = True
+        else:
+             self._stale_check_done = True
+             
+        # 2. Check Daily Drawdown
+             
+        # 2. Check Daily Drawdown
+        daily_dd = (self.daily_start_balance - current_equity) / self.daily_start_balance
+        
+        if daily_dd > config.IMMUNE_MAX_DAILY_DRAWDOWN:
+             msg = f"🌡️ FEVER DETECTED: Drawdown {daily_dd*100:.2f}% > Limit {config.IMMUNE_MAX_DAILY_DRAWDOWN*100:.1f}%"
+             print(f"[{self.name}] {msg}")
+             self.is_system_healthy = False
+             return False, msg
+             
+        # 3. Check Principal
+        if current_equity < config.PRINCIPAL:
+             msg = f"⚠️ PRINCIPAL BREACH: ${current_equity:.2f} < ${config.PRINCIPAL:.2f}"
+             print(f"[{self.name}] {msg}")
+             self.is_system_healthy = False
+             return False, msg
+             
+        return True, "OK"
 
     def receive_message(self, sender: Any, content: Any) -> Any:
         if isinstance(content, dict) and content.get('type') == 'CHECK_HEALTH':

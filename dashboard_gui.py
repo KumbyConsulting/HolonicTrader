@@ -13,202 +13,150 @@ matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import matplotlib.dates as mdates
+from mpl_toolkits.mplot3d import Axes3D # 3D Viz
 
 # Import the bot runners
-from main_live_phase4 import run_bot
-from run_backtest import run_backtest
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), 'scripts'))
+# from main_live_phase4 import run_bot
+# from run_backtest import run_backtest
 
-# === IMPROVEMENT 1: DARK MODE COLORS ===
+# Theme Colors
+# Theme Colors: BLOOMBERG TERMINAL EDITION
 COLORS = {
-    'bg_dark': '#1a1a2e',
-    'bg_card': '#16213e',
-    'bg_input': '#0f3460',
-    'accent': '#e94560',
-    'accent_green': '#00e676',
-    'accent_red': '#ff5252',
-    'accent_yellow': '#ffd740',
-    'accent_blue': '#40c4ff',
-    'text_primary': '#ffffff',
-    'text_secondary': '#a0a0a0',
-    'border': '#333355'
+    'bg_dark': '#000000',       # Pure Black
+    'bg_card': '#141414',       # Dark Grey Cards
+    'text_primary': '#FFB300',  # Amber (Data)
+    'text_secondary': '#E0E0E0',# White (Labels)
+    'accent_primary': '#FF6D00',# Bloomberg Orange
+    'accent_secondary': '#00E5FF', # Cyan (Electric)
+    'accent_green': '#00C853',  # Terminal Green
+    'accent_red': '#D50000',    # Critical Red
+    'accent_yellow': '#FFD600', # Warning Yellow
+    'border': '#333333',
+    'bg_input': '#1A1A1A',
+    'accent_blue': '#2962FF',
+    'accent': '#FF6D00'
 }
 
 class HolonicDashboard:
     def __init__(self, root):
-        self.root = root
-        self.root.title("HolonicTrader Command Center")
-        self.root.geometry("1500x950")
+        # ... (init vars)
+        self.scout_last_read = 0.0
         
-        # === IMPROVEMENT 1: Apply Dark Mode ===
-        self.root.configure(bg=COLORS['bg_dark'])
-        self._setup_dark_theme()
+        # 3D Holospace Data
+        self.market_phase_data = {} # Symbol -> {'entropy': [], 'tda': [], 'price': [], 'vol': []}
+        self.max_phase_points = 50
         
-        # Threading vars
-        self.gui_queue = queue.Queue()
-        self.command_queue = queue.Queue() # Wrapper for thread commands
-        self.gui_stop_event = threading.Event()
-        self.bot_thread = None
+        # ... (config vars)
+        # Config Variables
+        self.conf_symbol = tk.StringVar(value="BTC/USDT")
+        self.conf_timeframe = tk.StringVar(value="1h")
+        self.conf_alloc = tk.DoubleVar(value=0.1)
+        self.conf_leverage = tk.DoubleVar(value=1.0)
+        self.conf_micro_mode = tk.BooleanVar(value=True)
+        
+        # State Variables
         self.is_running_live = False
         self.is_running_backtest = False
+        self.gui_queue = queue.Queue()
+        self.command_queue = queue.Queue()
+        self.gui_stop_event = threading.Event()
         
-        # PPO Tracking
-        self.last_ppo_conviction = 0.5
-        self.last_ppo_reward = 0.0
-        
-        # === IMPROVEMENT 2: Real-Time Equity Tracking ===
+        # UI State
+        self.status_var = tk.StringVar(value="🔴 STOPPED")
         self.equity_history = []
         self.max_equity_points = 100
-        
-        # === IMPROVEMENT 9: Order History ===
         self.order_history = []
         self.max_orders = 50
         
-        # === IMPROVEMENT 6: GC Monitor Status ===
-        self.gc_last_run = "Never"
-        self.gc_items_cleaned = 0
+        self.root = root
+        self.root.title("A E H M L   T R A D E R   //   P H A S E   I V")
+        self.root.geometry("1600x1000")
+        self.root.configure(bg=COLORS['bg_dark'])
         
-        # === IMPROVEMENT 8: Exchange Balance ===
-        self.exchange_balance = 0.0
-
-        # === IMPROVEMENT 10: Scout Data ===
-        self.scout_status = {}
-        self.scout_last_read = 0.0
+        # Style
+        self.style = ttk.Style()
+        self.style.theme_use('clam')
+        self._configure_styles()
         
-        # Configuration Vars
-        self.conf_symbol = tk.StringVar(value="XRP/USDT")
-        self.conf_timeframe = tk.StringVar(value="1h")
-        self.conf_alloc = tk.DoubleVar(value=0.10)
-        self.conf_leverage = tk.DoubleVar(value=5.0)
-
-        self._setup_ui()
-        
-        # Start the polling loop
-        self.root.after(100, self.process_queue)
-
-    # === IMPROVEMENT 1: DARK THEME SETUP ===
-    def _setup_dark_theme(self):
-        style = ttk.Style()
-        style.theme_use('clam')
-        
-        # Configure dark theme for all widgets
-        style.configure(".", 
-            background=COLORS['bg_dark'], 
-            foreground=COLORS['text_primary'],
-            fieldbackground=COLORS['bg_input'],
-            font=("Segoe UI", 10))
-        
-        style.configure("TFrame", background=COLORS['bg_dark'])
-        style.configure("TLabel", background=COLORS['bg_dark'], foreground=COLORS['text_primary'])
-        style.configure("TButton", 
-            background=COLORS['bg_card'], 
-            foreground=COLORS['text_primary'],
-            borderwidth=1,
-            focuscolor=COLORS['accent'])
-        style.map("TButton",
-            background=[('active', COLORS['accent']), ('pressed', COLORS['accent_red'])])
-        
-        style.configure("TNotebook", background=COLORS['bg_dark'], borderwidth=0)
-        style.configure("TNotebook.Tab", 
-            background=COLORS['bg_card'], 
-            foreground=COLORS['text_primary'],
-            padding=[15, 8])
-        style.map("TNotebook.Tab",
-            background=[('selected', COLORS['accent'])],
-            foreground=[('selected', COLORS['text_primary'])])
-        
-        style.configure("TLabelframe", 
-            background=COLORS['bg_card'], 
-            foreground=COLORS['accent'],
-            borderwidth=2,
-            relief="solid")
-        style.configure("TLabelframe.Label", 
-            background=COLORS['bg_card'], 
-            foreground=COLORS['accent'],
-            font=("Segoe UI", 11, "bold"))
-        
-        style.configure("Treeview",
-            background=COLORS['bg_card'],
-            foreground=COLORS['text_primary'],
-            fieldbackground=COLORS['bg_card'],
-
-            borderwidth=0,
-            rowheight=25, # Taller rows
-            font=("Consolas", 10)) # Readable font
-        style.configure("Treeview.Heading",
-            background=COLORS['bg_input'],
-            foreground=COLORS['accent'],
-            font=("Segoe UI", 10, "bold"))
-        style.map("Treeview",
-            background=[('selected', COLORS['accent'])])
-        
-        style.configure("TProgressbar",
-            background=COLORS['accent_green'],
-            troughcolor=COLORS['bg_input'])
-        
-        style.configure("Header.TLabel", font=("Segoe UI", 16, "bold"), foreground=COLORS['accent'])
-        style.configure("SubHeader.TLabel", font=("Segoe UI", 12, "bold"))
-        style.configure("Data.TLabel", font=("Consolas", 11), foreground=COLORS['accent_blue'])
-        style.configure("Status.TLabel", font=("Segoe UI", 12, "bold"))
-        
-        # Danger button style
-        style.configure("Danger.TButton",
-            background=COLORS['accent_red'],
-            foreground=COLORS['text_primary'],
-            font=("Segoe UI", 10, "bold"))
-        style.map("Danger.TButton",
-            background=[('active', '#ff0000')])
-
-    def _setup_ui(self):
-        # --- Header with Balance Display (IMPROVEMENT 8) ---
-        header_frame = ttk.Frame(self.root, padding="10 10 10 0")
-        header_frame.pack(fill=tk.X)
-        
-        ttk.Label(header_frame, text="🚀 AEHML HOLONIC TRADER", style="Header.TLabel").pack(side=tk.LEFT)
-        
-        # === IMPROVEMENT 8: Exchange Balance Display ===
-        balance_frame = ttk.Frame(header_frame)
-        balance_frame.pack(side=tk.LEFT, padx=50)
-        ttk.Label(balance_frame, text="💰 Balance:", style="SubHeader.TLabel").pack(side=tk.LEFT)
-        self.balance_label = ttk.Label(balance_frame, text="$0.00", style="Data.TLabel")
-        self.balance_label.pack(side=tk.LEFT, padx=5)
-        
-        self.status_var = tk.StringVar(value="SYSTEM READY")
-        self.status_label = ttk.Label(header_frame, textvariable=self.status_var, style="Status.TLabel", foreground=COLORS['accent_blue'])
-        self.status_label.pack(side=tk.RIGHT)
-
-        ttk.Separator(self.root, orient='horizontal').pack(fill=tk.X, pady=5)
-
-        # --- Main Notebook ---
+        # Notebook
         self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
-        # Tabs (IMPROVEMENT 9: Added Order History Tab)
+        # Tabs
         self.tab_live = ttk.Frame(self.notebook, padding=10)
-        self.tab_scout = ttk.Frame(self.notebook, padding=10) # 🔭 Scout Tab
+        self.tab_overwatch = ttk.Frame(self.notebook, padding=10)
+        self.tab_scout = ttk.Frame(self.notebook, padding=10)
         self.tab_agents = ttk.Frame(self.notebook, padding=10)
-        self.tab_overwatch = ttk.Frame(self.notebook, padding=10) # 👁️ Overwatch Tab (NEW)
+        self.tab_news = ttk.Frame(self.notebook, padding=10)
         self.tab_orders = ttk.Frame(self.notebook, padding=10)
-        self.tab_news = ttk.Frame(self.notebook, padding=10) # 📰 New Tab
         self.tab_config = ttk.Frame(self.notebook, padding=10)
         self.tab_backtest = ttk.Frame(self.notebook, padding=10)
         
         self.notebook.add(self.tab_live, text="  📊 Live Operations  ")
-        self.notebook.add(self.tab_overwatch, text="  👁️ Overwatch  ") # <--- NEW
+        self.notebook.add(self.tab_overwatch, text="  👁️ Overwatch  ")
         self.notebook.add(self.tab_scout, text="  🔭 Scout Radar  ")
         self.notebook.add(self.tab_agents, text="  🤖 Holon Status  ")
         self.notebook.add(self.tab_news, text="  📰 News & Trends  ")
         self.notebook.add(self.tab_orders, text="  📋 Order History  ")
+        
+        # NEW TAB
+        self.tab_holospace = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(self.tab_holospace, text="  🧊 3D Holospace  ")
+        
         self.notebook.add(self.tab_config, text="  ⚙️ Configuration  ")
         self.notebook.add(self.tab_backtest, text="  📈 Backtesting  ")
         
         self._setup_live_tab()
-        self._setup_overwatch_tab() # <--- NEW
+        self._setup_overwatch_tab()
         self._setup_scout_tab()
         self._setup_agents_tab()
-        self._setup_news_tab() # 📰 Setup Method
+        self._setup_news_tab()
         self._setup_orders_tab()
+        self._setup_holospace_tab() # SETUP
         self._setup_config_tab()
         self._setup_backtest_tab()
+        
+        # Start Message Queue Loop
+        self.process_queue()
+
+    def _configure_styles(self):
+        s = self.style
+        
+        # General formatting
+        s.configure(".", background=COLORS['bg_dark'], foreground=COLORS['text_primary'], font=('Segoe UI', 10))
+        s.configure("TFrame", background=COLORS['bg_dark'])
+        s.configure("TLabelframe", background=COLORS['bg_dark'], foreground=COLORS['text_secondary'])
+        s.configure("TLabelframe.Label", background=COLORS['bg_dark'], foreground=COLORS['accent_primary'], font=('Segoe UI', 11, 'bold'))
+        
+        # Buttons
+        s.configure("TButton", padding=5, font=('Segoe UI', 9, 'bold'))
+        s.map("TButton", background=[('active', COLORS['accent_primary'])], foreground=[('active', 'white')])
+        
+        # Danger Button
+        s.configure("Danger.TButton", foreground=COLORS['accent_red'])
+        
+        # Labels
+        s.configure("Header.TLabel", font=('Segoe UI', 16, 'bold'), foreground=COLORS['accent_primary'])
+        s.configure("SubHeader.TLabel", font=('Segoe UI', 10, 'bold'), foreground=COLORS['text_secondary'])
+        s.configure("Accent.TLabel", foreground=COLORS['accent_secondary'])
+        s.configure("Data.TLabel", font=('Consolas', 11), foreground=COLORS['text_primary'])
+        
+        # Treeview
+        s.configure("Treeview", 
+            background=COLORS['bg_card'], 
+            foreground=COLORS['text_primary'], 
+            fieldbackground=COLORS['bg_card'],
+            rowheight=25,
+            font=('Consolas', 9)
+        )
+        s.configure("Treeview.Heading", font=('Segoe UI', 9, 'bold'), background=COLORS['bg_dark'], foreground=COLORS['text_secondary'])
+        s.map("Treeview", background=[('selected', COLORS['accent_primary'])])
+        
+        # News Card
+        s.configure("Card.TFrame", background='#0b0e14')
 
     # ========================== TAB 1: LIVE ==========================
     def _setup_live_tab(self):
@@ -225,6 +173,10 @@ class HolonicDashboard:
         # === IMPROVEMENT 7: PANIC BUTTON ===
         self.panic_btn = ttk.Button(ctl_frame, text="🚨 PANIC CLOSE ALL", command=self.panic_close_all, style="Danger.TButton")
         self.panic_btn.pack(side=tk.RIGHT, padx=5)
+        
+        # Status Label
+        self.status_label = ttk.Label(ctl_frame, textvariable=self.status_var, font=('Segoe UI', 10, 'bold'), foreground=COLORS['accent_red'])
+        self.status_label.pack(side=tk.LEFT, padx=15)
         
         # === IMPROVEMENT 10: Log Export Button ===
         self.export_btn = ttk.Button(ctl_frame, text="💾 Export Log", command=self.export_log)
@@ -258,6 +210,11 @@ class HolonicDashboard:
         ttk.Label(r_grid, text="PROMOTION IN:", style="SubHeader.TLabel").grid(row=0, column=5, padx=15, sticky="w")
         self.promo_label = ttk.Label(r_grid, text="--:--:--", style="Data.TLabel")
         self.promo_label.grid(row=0, column=6, padx=5, sticky="w")
+        
+        # 4. Balance (IMPROVEMENT 8)
+        ttk.Label(r_grid, text="BALANCE:", style="SubHeader.TLabel").grid(row=0, column=7, padx=15, sticky="w")
+        self.balance_label = ttk.Label(r_grid, text="Loading...", style="Data.TLabel", foreground=COLORS['accent_green'])
+        self.balance_label.grid(row=0, column=8, padx=5, sticky="w")
         
         # Left Col: Metrics & Table
         left_col = ttk.Frame(grid_frame)
@@ -313,7 +270,7 @@ class HolonicDashboard:
             
         self.radar_tree.tag_configure('keep', foreground=COLORS['accent_green'])
         self.radar_tree.tag_configure('close', foreground=COLORS['accent_red'])
-        self.radar_tree.tag_configure('force', foreground=COLORS['accent'], background='#331111')
+        self.radar_tree.tag_configure('force', foreground=COLORS['accent_primary'], background='#331111')
         
         # === IMPROVEMENT 4: Position Cards (Hidden/Miniaturized or kept?) -> Kept below radar?
         # Maybe move to right col or float? Let's keep it compacted.
@@ -412,7 +369,9 @@ class HolonicDashboard:
         self.gov_alloc = self._metric(gov_frame, "Max Allocation:", "10.0%", 1)
         self.gov_lev = self._metric(gov_frame, "Leverage Cap:", "5.0x", 2)
         self.gov_trends = self._metric(gov_frame, "Active Trends:", "0", 3)
-        self.gov_micro = self._metric(gov_frame, "Micro Mode:", "UNKNOWN", 4) # New Metric
+        self.gov_micro = self._metric(gov_frame, "Micro Mode:", "UNKNOWN", 4) 
+        self.gov_fortress = self._metric(gov_frame, "🏰 Iron Bank Floor:", "$0.00", 5) # New
+        self.gov_budget = self._metric(gov_frame, "⚔️ Risk Budget:", "$0.00", 6) # New
         
         # Actuator (Execution)
         act_frame = ttk.LabelFrame(container, text="⚙️ Actuator Holon (Execution)", padding=15)
@@ -734,6 +693,83 @@ class HolonicDashboard:
         self.chart_frame = ttk.LabelFrame(self.tab_backtest, text="Equity Curve")
         self.chart_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         self._setup_chart()
+    # ========================== TAB 7: 3D HOLOSPACE ==========================
+    def _setup_holospace_tab(self):
+        # Control Panel
+        ctl = ttk.Frame(self.tab_holospace)
+        ctl.pack(fill=tk.X, padx=10, pady=5)
+        
+        ttk.Label(ctl, text="🧊 Market Phase Space (Entropy vs Topology vs Price)", style="Header.TLabel").pack(side=tk.LEFT)
+        ttk.Button(ctl, text="🔄 Reset View", command=self._reset_3d_view).pack(side=tk.RIGHT)
+        
+        # 3D Canvas
+        self.fig_3d = Figure(figsize=(8, 6), dpi=100, facecolor=COLORS['bg_card'])
+        self.ax_3d = self.fig_3d.add_subplot(111, projection='3d')
+        self._style_3d_axes()
+        
+        self.canvas_3d = FigureCanvasTkAgg(self.fig_3d, master=self.tab_holospace)
+        self.canvas_3d.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
+    def _style_3d_axes(self):
+        self.ax_3d.set_facecolor(COLORS['bg_dark'])
+        self.ax_3d.xaxis.set_pane_color((0.1, 0.1, 0.18, 1.0))
+        self.ax_3d.yaxis.set_pane_color((0.1, 0.1, 0.18, 1.0))
+        self.ax_3d.zaxis.set_pane_color((0.1, 0.1, 0.18, 1.0))
+        
+        self.ax_3d.grid(color=COLORS['border'], linestyle=':', linewidth=0.5)
+        
+        # Labels
+        self.ax_3d.set_xlabel('Entropy (Chaos)', color=COLORS['accent_red'])
+        self.ax_3d.set_ylabel('TDA Score (Structure)', color=COLORS['accent_blue'])
+        self.ax_3d.set_zlabel('Price Change %', color=COLORS['accent_green'])
+        
+        self.ax_3d.tick_params(axis='x', colors=COLORS['text_secondary'])
+        self.ax_3d.tick_params(axis='y', colors=COLORS['text_secondary'])
+        self.ax_3d.tick_params(axis='z', colors=COLORS['text_secondary'])
+        
+    def _reset_3d_view(self):
+        self.ax_3d.view_init(elev=30, azim=-60)
+        self.canvas_3d.draw()
+
+    def _update_holospace(self):
+        # Only redraw if tab is visible to save GPU/CPU
+        if self.notebook.select() != str(self.tab_holospace):
+            return
+
+        self.ax_3d.clear()
+        self._style_3d_axes()
+        
+        # Plot Trajectories
+        has_data = False
+        
+        for sym, history in self.market_phase_data.items():
+            if len(history) < 2: continue
+            
+            # Extract Components
+            xs = [p['entropy'] for p in history]
+            ys = [p['tda'] for p in history]
+            
+            # Normalize Price relative to start of history window (for Z-axis)
+            p0 = history[0]['price']
+            zs = [((p['price'] - p0) / p0) * 100 for p in history]
+            
+            # Color based on latest movement
+            color = COLORS['accent_green'] if zs[-1] > zs[-2] else COLORS['accent_red']
+            if sym == "BTC/USDT": color = COLORS['accent_yellow']
+            
+            # Plot Line
+            self.ax_3d.plot(xs, ys, zs, color=color, linewidth=1, alpha=0.6)
+            
+            # Plot Head
+            self.ax_3d.scatter(xs[-1], ys[-1], zs[-1], color=color, s=20)
+            self.ax_3d.text(xs[-1], ys[-1], zs[-1], sym, color=COLORS['text_primary'], fontsize=8)
+            
+            has_data = True
+            
+        if not has_data:
+            self.ax_3d.text(0.5, 0.5, 0.5, "Waiting for Data...", color=COLORS['text_secondary'], ha='center')
+            
+        self.canvas_3d.draw()
 
     # ========================== LOGIC ==========================
     def _metric(self, parent, text, default, row):
@@ -929,8 +965,18 @@ class HolonicDashboard:
         }
         
         self.gui_stop_event.clear()
-        self.gui_stop_event.clear()
-        self.bot_thread = threading.Thread(target=run_bot, args=(self.gui_stop_event, self.gui_queue, cfg, self.command_queue))
+        
+        # LAZY LOAD WRAPPER: Prevents UI Freeze during TensorFlow Import
+        def run_wrapper(stop_event, queue, cfg, cmd_queue):
+            try:
+                from main_live_phase4 import run_bot
+                run_bot(stop_event, queue, cfg, cmd_queue)
+            except Exception as e:
+                print(f"CRITICAL BOOT ERROR: {e}")
+                import traceback
+                traceback.print_exc()
+
+        self.bot_thread = threading.Thread(target=run_wrapper, args=(self.gui_stop_event, self.gui_queue, cfg, self.command_queue))
         self.bot_thread.daemon = True
         self.bot_thread.start()
         
@@ -1131,7 +1177,8 @@ class HolonicDashboard:
         except Exception as e:
             print(f"[Dashboard] Queue error: {e}")
         finally:
-            self._update_scout_radar() # Check for Scout updates
+            # self._update_scout_radar() # DEPRECATED: Handled via Queue
+            self._update_holospace() # Refresh 3D Viz
             self.root.after(100, self.process_queue)
     
     def _handle_queue_message(self, msg):
@@ -1142,10 +1189,29 @@ class HolonicDashboard:
             
         elif mtype == 'summary':
             data = msg.get('data', [])
+            # Only full refresh if data is meaningful
+            if not data: return
+            
+            # Clear existing items
             for item in self.tree.get_children():
                 self.tree.delete(item)
             
             for row in data:
+                # 3D Holospace Data Capture
+                if '_entropy' in row and '_tda' in row:
+                    sym = row.get('Symbol', 'UNKNOWN')
+                    if sym not in self.market_phase_data: self.market_phase_data[sym] = []
+                    
+                    self.market_phase_data[sym].append({
+                        'entropy': float(row['_entropy']),
+                        'tda': float(row['_tda']),
+                        'price': float(row['_price']),
+                        'vol': float(row.get('_vol', 0.0))
+                    })
+                    
+                    if len(self.market_phase_data[sym]) > self.max_phase_points:
+                        self.market_phase_data[sym].pop(0)
+
                 pnl_str = row.get('PnL', '-')
                 struct_mode = row.get('Struct', '-')
                 
@@ -1155,9 +1221,9 @@ class HolonicDashboard:
                 elif '-' in str(pnl_str) and pnl_str != '-':
                     tag = 'loss'
                 elif 'BREAKOUT' in struct_mode:
-                    tag = 'profit' # Re-use Green for Breakout
+                    tag = 'profit'
                 elif 'BREAKDOWN' in struct_mode:
-                    tag = 'loss' # Re-use Red for Breakdown
+                    tag = 'loss'
                 
                 # Check for Whale
                 action_text = row.get('Action', '')
@@ -1169,7 +1235,7 @@ class HolonicDashboard:
                     row.get('Price'),
                     row.get('Regime', '?'),
                     row.get('Entropy', '0.00'),
-                    row.get('Struct', '-'), # NEW
+                    row.get('Struct', '-'),
                     row.get('RSI', '-'),
                     row.get('LSTM', '0.50'),
                     row.get('XGB', '0.50'),
@@ -1193,6 +1259,8 @@ class HolonicDashboard:
             self.gov_alloc.config(text=data.get('gov_alloc', '-'))
             self.gov_lev.config(text=data.get('gov_lev', '-'))
             self.gov_trends.config(text=data.get('gov_trends', '0'))
+            self.gov_fortress.config(text=data.get('fortress_balance', '-'))
+            self.gov_budget.config(text=data.get('risk_budget', '-'))
             
             self.ag_regime.config(text=data.get('regime', '?'))
             self.ag_entropy.config(text=data.get('entropy', '0.0'))
@@ -1224,12 +1292,12 @@ class HolonicDashboard:
             
             # === IMPROVEMENT 8: Update Balance ===
             balance = data.get('balance')
-            if balance:
+            if balance is not None:
                 self.balance_label.config(text=f"${float(balance):.2f}")
             
             # === IMPROVEMENT 2: Update Equity Chart ===
             equity = data.get('equity')
-            if equity:
+            if equity is not None:
                 self.update_equity_chart(float(equity))
             
             # === IMPROVEMENT 4: Update Position Cards ===
@@ -1238,7 +1306,64 @@ class HolonicDashboard:
             current_prices = data.get('current_prices', {})
             if holdings:
                 self.update_position_cards(holdings, entry_prices, current_prices)
+
+            # === Solvency Override ===
+            solvency = data.get('solvency_status', 'SOLVENT')
+            if solvency == 'INSOLVENT':
+                 self.health_label.config(text="INSOLVENT", foreground=COLORS['accent_red'])
+            elif 'health_score' in data:
+                 h_score = float(data['health_score'])
+                 self.health_progress['value'] = h_score * 100
+                 self.health_label.config(text=f"{h_score:.2f}")
+                 
+                 # Regime Label
+                 regime = data.get('regime', 'UNKNOWN')
+                 self.regime_label.config(text=regime)
+                 
+                 fg = COLORS['accent_yellow'] 
+                 if "SMALL" in regime: fg = COLORS['accent_blue']
+                 if "MEDIUM" in regime: fg = COLORS['accent_green']
+                 if "LARGE" in regime: fg = '#ff00ff' 
+                 self.regime_label.config(foreground=fg)
+                 
+                 # Promotion Logic
+                 if h_score >= 0.95:
+                     self.promo_label.config(text="ELIGIBLE (Wait 72h)", foreground=COLORS['accent_green'])
+                 else:
+                     self.promo_label.config(text="BUILDING...", foreground=COLORS['text_secondary'])
+            
+            # === UPDATED: Consume Explicit Queue Data (No Overwrites) ===
+            # 1. Update Consolidation Radar (Kill List) - Bottom Left
+            consolidation_data = data.get('consolidation_data', [])
+            if consolidation_data:
+                # Clear and Repopulate Radar Tree
+                for item in self.radar_tree.get_children():
+                    self.radar_tree.delete(item)
                 
+                for i, r in enumerate(consolidation_data):
+                    # Format: {'symbol': 'BTC', 'score': 0.85, 'reason': 'High Vol'}
+                    sym = r.get('symbol', 'UNKNOWN')
+                    score = r.get('score', 0.0)
+                    reason = r.get('reason', 'Scanning...')
+                    
+                    status = "HIGH RISK" if score > 0.8 else "WATCH"
+                    tag = 'close' if score > 0.8 else 'neutral'
+                    
+                    self.radar_tree.insert('', 'end', values=(
+                        f"#{i+1}", 
+                        sym, 
+                        f"{score:.2f}", 
+                        "-", # PnL not passed here yet
+                        "-", # Age
+                        "-", # Effect Age
+                        status
+                    ), tags=(tag,))
+            
+            # 2. Update Scout Watchlist - Scout Tab
+            scout_data = data.get('scout_data', [])
+            if scout_data:
+                 self._update_scout_text(scout_data)
+
         elif mtype == 'order':
             order = msg.get('data', {})
             self._add_order_to_history(order)
@@ -1269,23 +1394,51 @@ class HolonicDashboard:
             self.ov_text.insert(tk.END, sitrep)
             self.ov_text.config(state=tk.DISABLED)
 
+    def _update_scout_text(self, scout_data):
+        self.scout_text.delete(1.0, tk.END)
+        for item in scout_data:
+            symbol = item.get('symbol', '?')
+            reason = item.get('reason', 'UNKNOWN')
+            
+            icon = "💀"
+            color = COLORS['text_secondary']
+            
+            if reason == 'ROCKET':
+                icon = "🚀"
+                color = COLORS['accent_red']
+            elif reason == 'ANCHOR':
+                icon = "⚓"
+                color = COLORS['accent_blue']
+                
+            tag_name = f"tag_{reason}"
+            self.scout_text.tag_config(tag_name, foreground=color)
+            self.scout_text.insert(tk.END, f"{icon} {symbol:<10} [{reason}]\n", tag_name)
+
     # === IMPROVEMENT 9: Add Order to History ===
     def _add_order_to_history(self, order):
         if len(self.order_history) >= self.max_orders:
-            oldest = self.order_tree.get_children()[0]
-            self.order_tree.delete(oldest)
-            self.order_history.pop(0)
+            try:
+                oldest = self.order_tree.get_children()[0]
+                self.order_tree.delete(oldest)
+                self.order_history.pop(0)
+            except: pass
         
-        side = order.get('side', 'BUY')
-        status = order.get('status', 'PENDING')
-        tag = 'buy' if side.upper() == 'BUY' else 'sell'
+        # Handle Case Mismatch (Executor sends Title Case, Local expected lowercase)
+        # Normalize to lowercase keys if needed, or check both
+        side = order.get('side') or order.get('Side') or 'BUY'
+        status = order.get('status') or order.get('Status') or 'PENDING'
+        
+        # Determine Tag
+        tag = 'buy' if str(side).upper() == 'BUY' else 'sell'
+        if str(status).upper() == 'CANCELED': tag = 'canceled'
+        if str(status).upper() == 'FILLED': tag = 'filled'
         
         values = (
-            order.get('time', datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
-            order.get('symbol', '-'),
+            order.get('time') or order.get('Time') or datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            order.get('symbol') or order.get('Symbol') or '-',
             side,
-            f"{order.get('qty', 0):.4f}",
-            f"${order.get('price', 0):.2f}",
+            f"{float(order.get('qty', 0) or order.get('Qty', 0)):.4f}",
+            f"${float(order.get('price', 0) or order.get('Price', 0)):.2f}",
             status
         )
         self.order_tree.insert('', 0, values=values, tags=(tag,))
@@ -1299,7 +1452,11 @@ class HolonicDashboard:
         symbol = self.conf_symbol.get()
         
         def run_and_reset():
-            run_backtest(self.gui_queue, symbol=symbol)
+            try:
+                from run_backtest import run_backtest
+                run_backtest(self.gui_queue, symbol=symbol)
+            except Exception as e:
+                print(f"Backtest Error: {e}")
             self.is_running_backtest = False
         
         t = threading.Thread(target=run_and_reset)

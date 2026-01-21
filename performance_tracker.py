@@ -11,6 +11,7 @@ from rich.text import Text
 from rich import box
 
 DB_PATH = "holonic_trader.db"
+DB_PATH = "holonic_trader.db"
 console = Console()
 
 def calculate_omega_ratio(returns: list, threshold: float = 0.0) -> float:

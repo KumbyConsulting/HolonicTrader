@@ -130,9 +130,16 @@ class SentimentHolon(Holon):
             ]
             
         all_items = []
+        import requests # Lazy import or ensure at top
+        
         for url in self.sources:
             try:
-                feed = feedparser.parse(url)
+                # FIX: Use requests with timeout to prevent hanging
+                resp = requests.get(url, timeout=4.0)
+                if resp.status_code != 200:
+                    continue
+                    
+                feed = feedparser.parse(resp.content)
                 source_name = feed.feed.get('title', 'Unknown Source')
                 for entry in feed.entries[:5]: # Top 5 per source
                     all_items.append({
@@ -141,7 +148,7 @@ class SentimentHolon(Holon):
                         'source': source_name
                     })
             except Exception as e:
-                print(f"[{self.name}] RSS Error ({url}): {e}")
+                print(f"[{self.name}] RSS Error ({url}): {str(e)[:50]}...")
                 
         return all_items
 

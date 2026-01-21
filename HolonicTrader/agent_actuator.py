@@ -52,6 +52,98 @@ class ActuatorHolon(Holon):
         # Kraken Symbol Mapping (Internal USDT -> Kraken USD)
         self.symbol_map = config.KRAKEN_SYMBOL_MAP
 
+        # --- CIRCUIT BREAKER STATE ---
+        self.error_count = 0
+        self.circuit_open = False
+        self.hibernate_until = 0.0
+        self.MAX_CONSECUTIVE_ERRORS = getattr(config, 'API_MAX_RETRIES', 15) 
+        self.HIBERNATION_TIME = getattr(config, 'API_HIBERNATION_TIME', 60)
+        
+        # Caching to prevent API Rate Limit Spam (Phase 4 Optimization)
+        self.cached_equity = None
+        self.last_equity_time = 0.0
+        self.cached_balance = {}
+        self.last_balance_time = 0.0
+        self.last_balance_time = 0.0
+        self.CACHE_TTL = 3.0 # Cache duration for balance calls
+        
+        # Phase 6: Error Cooldowns (Nano/Micro Efficiency)
+        self.failed_orders = {} # {f"{symbol}_{error}": timestamp}
+
+    def check_circuit_breaker(self) -> bool:
+        """
+        Returns True if Circuit is CLOSED (Healthy).
+        Returns False if Circuit is OPEN (Broken/Hibernating).
+        """
+        if self.circuit_open:
+            remaining = self.hibernate_until - time.time()
+            if remaining > 0:
+                # Still hibernating
+                # verbose log only every 60s?
+                if int(remaining) % 60 == 0:
+                    print(f"[{self.name}] 💤 API CIRCUIT OPEN: Hibernating for {int(remaining)}s (Too many 503s)")
+                return False
+            else:
+                # Wake up
+                print(f"[{self.name}] 🌅 API CIRCUIT RESET: Attempting to reconnect...")
+                self.circuit_open = False
+                self.error_count = 0
+                return True
+        return True
+
+    def can_retry_order(self, symbol: str, error_type: str = 'General') -> bool:
+        """
+        Check if we are in cooldown for this specific error on this symbol.
+        Prevents infinite retry loops on non-transient errors (e.g. Insufficient Funds).
+        """
+        key = f"{symbol}_{error_type}"
+        last_time = self.failed_orders.get(key, 0)
+        
+        # If config has NANO_COOLDOWN, use it, else default 300
+        cooldown = getattr(config, 'NANO_COOLDOWN_AFTER_FAILURE', 300)
+        
+        if time.time() - last_time < cooldown:
+            remaining = int(cooldown - (time.time() - last_time))
+            if remaining % 60 == 0: # Reduce log spam
+                print(f"[{self.name}] ⏳ COOLDOWN ACTIVE: {symbol} ({remaining}s rem) due to {error_type}")
+            return False
+            
+        # --- NANO-MODE GLOBAL LOCK (One Strike Rule) ---
+        # If ANY order failed in the last 24h, block ALL trades
+        nano_cap = getattr(config, 'NANO_CAPITAL_THRESHOLD', 50.0)
+        # We need access to balance to confirm Nano Mode, usually this Holon doesn't track it directly but we can infer
+        # or use config provided threshold. Assuming we are in Nano Mode if cooldown is long (86400).
+        if cooldown > 3600: # If cooldown is hours long, it implies Nano Strictness
+             # Check if ANY failure exists in recent history
+             for f_key, f_time in self.failed_orders.items():
+                  if time.time() - f_time < cooldown:
+                       print(f"[{self.name}] 🔒 NANO GLOBAL LOCK: Trading halted due to {f_key} failure.")
+                       return False
+        # -----------------------------------------------
+        
+        return True
+
+    def record_order_failure(self, symbol: str, error_type: str):
+        """Record a failure to trigger cooldown."""
+        key = f"{symbol}_{error_type}"
+        self.failed_orders[key] = time.time()
+
+    def report_success(self):
+        """Call this after a successful API interaction to reset counters."""
+        if self.error_count > 0:
+            self.error_count = 0
+            # print(f"[{self.name}] 🟢 API Connection Stabilized.")
+
+    def report_failure(self, error_msg: str):
+        """Call this after a Network/503 Error."""
+        self.error_count += 1
+        print(f"[{self.name}] ⚠️ API Error #{self.error_count}: {error_msg}")
+        
+        if self.error_count >= self.MAX_CONSECUTIVE_ERRORS:
+            self.circuit_open = True
+            self.hibernate_until = time.time() + self.HIBERNATION_TIME
+            print(f"[{self.name}] 💥 CIRCUIT BREAKER TRIPPED: Entering {self.HIBERNATION_TIME}s Hibernation to save API Quota.")
+
     def check_liquidity(self, symbol: str, direction: str, quantity: float, price: float) -> bool:
         """
         Verify that the order book has sufficient depth to absorb this order
@@ -95,22 +187,50 @@ class ActuatorHolon(Holon):
 
     def get_account_balance(self, asset: str = 'USDT') -> float:
         """
-        Fetch REAL free balance from exchange.
+        Fetch REAL free balance (Available Margin) from exchange.
         """
+        if not self.check_circuit_breaker(): return 0.0
+
+        # Cache Check
+        if (asset in self.cached_balance) and (time.time() - self.last_balance_time < self.CACHE_TTL):
+            return self.cached_balance.get(asset, 0.0)
+
         for attempt in range(3):
             try:
                 balance = self.exchange.fetch_balance()
+                self.report_success()
                 
-                # Check for Unified Margin 'total' or 'free'
-                # Kraken Futures usually puts USD in 'free'
+                # Kraken Futures specific mapping
+                if config.TRADING_MODE == 'FUTURES':
+                    info = balance.get('info', {})
+                    # Try to get explicit 'availableMargin' from flex account
+                    # Structure: info -> accounts -> flex -> availableMargin
+                    try:
+                        accounts = info.get('accounts', {})
+                        flex = accounts.get('flex', {})
+                        avail_margin = float(flex.get('availableMargin', 0.0))
+                        if avail_margin > 0:
+                            self.cached_balance['USDT'] = avail_margin
+                            self.last_balance_time = time.time()
+                            return avail_margin
+                    except Exception as e_flex: 
+                        print(f"[{self.name}] ⚠️ Futures Flex Margin Check Failed: {e_flex}")
+
+                # Fallback to standard CCXT 'free'
                 b_usd = balance['free'].get('USD', 0.0)
                 b_usdt = balance['free'].get('USDT', 0.0)
                 b_zusd = balance['free'].get('ZUSD', 0.0)
                 
                 total_avail = max(b_usd, b_usdt, b_zusd)
-                # print(f"[{self.name}] 💰 Real Balance: ${total_avail:.2f}")
+                
+                # Update Cache
+                self.cached_balance['USDT'] = total_avail
+                self.cached_balance['USD'] = total_avail
+                self.last_balance_time = time.time()
+                
                 return total_avail
             except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+                self.report_failure(str(e))
                 if attempt == 2:
                     print(f"[{self.name}] ❌ Balance Check Failed after 3 attempts: {e}")
                     return 0.0
@@ -122,9 +242,17 @@ class ActuatorHolon(Holon):
         Fetch TOTAL EQUITY (Balance + Unrealized PnL).
         Crucial for accurate Drawdown calculation in Governor.
         """
+        if not self.check_circuit_breaker(): return None
+
+        # Cache Check
+        if self.cached_equity and (time.time() - self.last_equity_time < self.CACHE_TTL):
+             return self.cached_equity
+
         for attempt in range(3):
             try:
                 balance = self.exchange.fetch_balance()
+                self.report_success()
+
                 info = balance.get('info', {})
                 
                 # 1. Futures: Explicit marginEquity
@@ -133,17 +261,25 @@ class ActuatorHolon(Holon):
                     flex = accounts.get('flex', {})
                     total_equity = float(flex.get('marginEquity', 0.0))
                     if total_equity > 0:
+                        self.cached_equity = total_equity
+                        self.last_equity_time = time.time()
                         return total_equity
                         
                 # 2. Spot/Unified: Equivalent Balance ('eb')
                 equity = float(info.get('eb', 0.0))
                 if equity > 0:
+                     self.cached_equity = equity
+                     self.last_equity_time = time.time()
                      return equity
                      
                 # 3. Fallback: Total USD
-                return balance.get('total', {}).get('USD', 0.0)
+                usd_bal = balance.get('total', {}).get('USD', 0.0)
+                self.cached_equity = usd_bal
+                self.last_equity_time = time.time()
+                return usd_bal
                 
             except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+                self.report_failure(str(e))
                 if attempt == 2:
                      print(f"[{self.name}] ❌ Equity Check Failed after 3 attempts: {e}")
                      return None # Return None instead of 0.0 to prevent panic
@@ -151,61 +287,122 @@ class ActuatorHolon(Holon):
         return None
 
     def get_buying_power(self, leverage: float = 5.0) -> float:
+        # ... (unchanged, but relying on get_account_balance now more reliable)
+        return self.get_account_balance() * leverage
+
+    # ... (skipping cancel_all_orders as it remains same/similar) ...
+
+    def close_position(self, symbol: str, qty: float = None) -> bool:
         """
-        Fetch Effective Buying Power (Equity * Leverage).
-        Uses Kraken's 'eb' (Equivalent Balance) or 'tb' (Trade Balance).
+        Close an existing position (Market Order).
+        Handles side inversion and reduceOnly flag automatically.
         """
-        for attempt in range(3):
-            try:
-                balance = self.exchange.fetch_balance()
-                info = balance.get('info', {})
+        if not self.check_circuit_breaker(): return False
+        
+        try:
+            # 1. Fetch Position to verify it exists and get direction
+            positions = self.exchange.fetch_positions()
+            target_pos = None
+            
+            # Map symbol if needed
+            exec_symbol = config.KRAKEN_SYMBOL_MAP.get(symbol, symbol)
+            
+            for p in positions:
+                if p['symbol'] == exec_symbol:
+                    target_pos = p
+                    break
+                    
+            if not target_pos:
+                print(f"[{self.name}] ⚠️ Close Failed: No active position found for {symbol} ({exec_symbol})")
+                return False
                 
-                # 1. Try Equivalent Balance (Equity) - Spot/Unified
-                equity = float(info.get('eb', 0.0))
+            current_qty = float(target_pos.get('contracts', 0.0))
+            if current_qty == 0:
+                print(f"[{self.name}] ⚠️ Close Failed: Position size is 0 for {symbol}")
+                return False
                 
-                # 2. Try Futures 'marginEquity' (Common in Kraken Futures API)
-                if equity <= 0 and config.TRADING_MODE == 'FUTURES':
-                    # Handle Kraken Futures 'flex' account structure
-                    accounts = info.get('accounts', {})
-                    flex = accounts.get('flex', {})
-                    
-                    # Priority: availableMargin (Free to trade) -> marginEquity (Total Net Worth)
-                    # We use availableMargin to avoid rejecting orders due to tied up funds
-                    avail_margin = float(flex.get('availableMargin', 0.0))
-                    margin_equity = float(flex.get('marginEquity', 0.0))
-                    
-                    if avail_margin > 0:
-                        equity = avail_margin
-                        # NOTE: availableMargin is already " Buying Power / Leverage " ? 
-                        # No, usually it's the equity available for initial margin.
-                        # Buying Power = availableMargin * Leverage.
-                    elif margin_equity > 0:
-                         equity = margin_equity
-                    else:
-                        # Fallback to total USD if flex is empty (e.g. cash only)
-                        equity = balance.get('total', {}).get('USD', 0.0)
-                    
-                # 3. Fallback to Trade Balance
-                if equity <= 0:
-                    equity = float(info.get('tb', 0.0))
-                    
-                # 4. Fallback to Free Balance
-                if equity <= 0:
-                    return self.get_account_balance()
-                    
-                # Buying Power = Equity * Leverage
-                if config.TRADING_MODE == 'FUTURES':
-                    # For Futures, let's trust the configured leverage cap
-                    return equity * leverage
-                else:
-                    return equity * leverage
+            # 2. Determine Close Direction
+            pos_side = target_pos['side'] # 'long' or 'short'
+            close_side = 'SELL' if pos_side == 'long' else 'BUY'
+            
+            # 3. Determine Quantity
+            final_qty = current_qty
+            if qty is not None and qty < current_qty:
+                final_qty = qty
                 
-            except (ccxt.NetworkError, ccxt.ExchangeError) as e:
-                if attempt == 2:
-                    print(f"[{self.name}] ❌ Buying Power Check Failed: {e}")
-                    return self.get_account_balance()
-                time.sleep(1 * (attempt+1))
-        return self.get_account_balance()
+            print(f"[{self.name}] 🔪 CLOSING {symbol}: Found {pos_side.upper()} {current_qty}, Selling {final_qty} (Side: {close_side})")
+            
+            # --- UPDATE: CANCEL WORKING ORDERS FIRST ---
+            # Flush parent/stops to prevent conflicts
+            self.cancel_all_orders(symbol)
+            time.sleep(0.3) # Give exchange 300ms to process cancels
+            # ------------------------------------------
+
+            # 4. Execute Market Close
+            order_id = self.place_order(
+                symbol=symbol,
+                direction=close_side,
+                quantity=final_qty,
+                order_type='market',
+                reduce_only=True,
+                urgent=True
+            )
+            
+            return order_id is not None
+            
+        except Exception as e:
+            print(f"[{self.name}] ❌ Close Position Error: {e}")
+            return False
+
+    def place_stop_order(self, symbol: str, direction: str, quantity: float, stop_price: float) -> bool:
+        """
+        Place a Stop Loss Order (Reduce Only) to protect a position.
+        Direction: 'BUY' (for Short Cover) or 'SELL' (for Long Exit)
+        """
+        if not self.check_circuit_breaker(): return False
+        
+        try:
+            exec_symbol = config.KRAKEN_SYMBOL_MAP.get(symbol, symbol)
+            
+            # Stop Loss is always a 'stop' (market) or 'stop-limit'
+            # Kraken Futures uses 'stop' with triggerPrice
+            
+            # --- FIX: PRECISION FORMATTING ---
+            sl_price_str = self.exchange.price_to_precision(exec_symbol, stop_price)
+            qty_str = self.exchange.amount_to_precision(exec_symbol, quantity)
+            
+            # Convert back to float for safety with ccxt or pass compatible string if supported
+            # Safest is float for 'price' (sometimes) but strictly formatted string for params if specific API needs it.
+            # CCXT usually handles numbers fine if they are rounded to precision.
+            final_sl_price = float(sl_price_str)
+            final_qty = float(qty_str)
+            
+            params = {
+                'reduceOnly': True,
+                'stopPrice': final_sl_price, # CCXT Unified
+            }
+            if config.TRADING_MODE == 'FUTURES':
+                params['triggerPrice'] = final_sl_price # Specific for some futures exch
+            
+            print(f"[{self.name}] 🛡️ PLACING STOP LOSS: {direction} {final_qty} {symbol} @ {final_sl_price}")
+            
+            order = self.exchange.create_order(
+                symbol=exec_symbol,
+                type='stop', # Stop Market
+                side=direction.lower(),
+                amount=final_qty,
+                price=None, # Market Stop
+                params=params
+            )
+            
+            if order:
+                print(f"[{self.name}] ✅ STOP LOSS ACTIVE: {order['id']}")
+                return True
+            return False
+            
+        except Exception as e:
+            print(f"[{self.name}] ❌ Stop Loss Failed: {e}")
+            return False
 
     def place_order(self, symbol: str, direction: Literal['BUY', 'SELL'], quantity: float, price: float = 0.0, order_type: str = 'limit', margin: bool = True, leverage: float = 1.0, urgent: bool = False, reduce_only: bool = False):
         """
@@ -295,6 +492,18 @@ class ActuatorHolon(Holon):
              return None
         # ------------------------------
 
+        if not self.check_circuit_breaker():
+             print(f"[{self.name}] 🛑 CIRCUIT OPEN: Order for {symbol} REJECTED due to API instability.")
+             return None
+        # ------------------------------
+
+        # --- PATCH: ERROR COOLDOWN ---
+        if not self.can_retry_order(symbol, 'General'):
+             # We treat everything as 'General' for now to catch "Insufficient Funds" etc.
+             # Ideally pass specific error if known, but here we prevent the ATTEMPT.
+             return None
+        # -----------------------------
+
         print(f"[{self.name}] 🚀 PLACING {order_type.upper()} {direction} {final_qty} {exec_symbol} (Lev: {leverage}x, Reduce: {reduce_only})")
         
         try:
@@ -334,6 +543,25 @@ class ActuatorHolon(Holon):
                 params=params
             )
             
+            # Check for Exchange-level Rejection via Response Payload
+            # (Kraken often returns 200 OK but with 'rejected' status in body)
+            info = order.get('info', {})
+            status = order.get('status', '')
+            
+            if status == 'rejected' or info.get('status') == 'marketIsPostOnly':
+                print(f"[{self.name}] ⚠️ Order Rejected by Exchange: {info.get('status', status)}")
+                
+                # RETRY LOGIC FOR REJECTED ORDERS
+                if 'marketIsPostOnly' in str(info) or 'PostOnly' in str(info):
+                     print(f"[{self.name}] 🔄 Auto-Retrying Rejected Market Order as LIMIT...")
+                     return self.create_order(symbol, direction, quantity, price=check_price, order_type='limit', margin=margin, leverage=leverage, urgent=True)
+                
+                return None
+
+            if not order.get('id'):
+                print(f"[{self.name}] ❌ Exchange returned no Order ID! Treating as failure. Response: {order}")
+                return None
+
             order_record = {
                 'id': order['id'],
                 'symbol': symbol,
@@ -348,10 +576,22 @@ class ActuatorHolon(Holon):
             
             self.pending_orders.append(order_record)
             print(f"[{self.name}] ✅ Order Placed: {order['id']}")
+            self.report_success()
             return order['id']
             
         except Exception as e:
             msg = str(e)
+            # Only count as API failure if it's a network/exchange error, not logic (insufficient funds)
+            msg = str(e)
+            # Only count as API failure if it's a network/exchange error, not logic (insufficient funds)
+            if "NetworkError" in msg or "503" in msg or "Service Unavailable" in msg or "timed out" in msg:
+                self.report_failure(msg)
+            else:
+                # Logic Error (Funds, MinLimit, etc) -> Trigger specific cooldown
+                print(f"[{self.name}] ❌ Order Logic Error: {msg}")
+                self.record_order_failure(symbol, 'General')
+                return None
+            
             print(f"[{self.name}] ❌ Order Placement Failed: {msg}")
             
             # GUARD: INSUFFICIENT FUNDS -> DO NOT RETRY IMMEDIATELY
@@ -366,7 +606,14 @@ class ActuatorHolon(Holon):
             
             # RETRY LOGIC (Only for Limit Orders usually, but maybe Market failed?)
             # If Market order failed, we generally just fail.
+            # RETRY LOGIC (Only for Limit Orders usually, but maybe Market failed?)
+            # If Market order failed, we generally just fail.
             if order_type == 'market':
+                # PATCH: Handle "marketIsPostOnly" or similar rejections by trying a Limit Order
+                if "marketIsPostOnly" in msg or "PostOnly" in msg:
+                     print(f"[{self.name}] ⚠️ Market Order Rejected ({msg}). Retrying as LIMIT...")
+                     # Retry as Limit at current price (Aggressive)
+                     return self.create_order(symbol, direction, quantity, price=check_price, order_type='limit', margin=margin, leverage=leverage, urgent=True)
                 return None
 
             # RETRY 1: TAKER RETRY (PostOnly Failed)
@@ -483,10 +730,85 @@ class ActuatorHolon(Holon):
                 print(f"[{self.name}] ❌ Order Placement Failed: {e}")
                 return None
             
+    def fetch_order_status(self, order_id: str, symbol: str = None) -> dict:
+        """
+        Fetch status of a specific order.
+        Updates internal pending_orders state if filled/closed (prevents stale locks).
+        """
+        if not self.check_circuit_breaker(): return None
+        
+        exec_symbol = self.symbol_map.get(symbol, symbol) if symbol else None
+        
+        try:
+            order = None
+            # 1. Try direct fetch (Supported by most CCXT drivers)
+            try:
+                order = self.exchange.fetch_order(order_id, symbol=exec_symbol)
+            except Exception as e:
+                # Fallback: Scan Open/Closed manually (Kraken Futures quirk?)
+                print(f"[{self.name}] ℹ️ Fetch Order {order_id} direct failed: {e}. Scanning Open/Closed...")
+                pass
+                
+            if not order:
+                # 2. Fallback Scan
+                if exec_symbol:
+                    # Check Open
+                    try:
+                        opens = self.exchange.fetch_open_orders(exec_symbol)
+                        for o in opens:
+                            if str(o['id']) == str(order_id):
+                                order = o
+                                break
+                    except Exception as e_scan: 
+                        print(f"[{self.name}] ⚠️ Open Order Scan Error: {e_scan}")
+                    
+                    # Check Closed
+                    if not order:
+                        try:
+                            closed = self.exchange.fetch_closed_orders(exec_symbol, limit=20)
+                            for o in closed:
+                                if str(o['id']) == str(order_id):
+                                    order = o
+                                    break
+                        except Exception as e_clos: 
+                            print(f"[{self.name}] ⚠️ Closed Order Scan Error: {e_clos}")
+            
+            if not order:
+                return None
+                
+            # Update Internal State
+            remote_status = order.get('status')
+            
+            # Find in pending
+            local_order = None
+            for o in self.pending_orders:
+                if str(o.get('id')) == str(order_id):
+                    local_order = o
+                    break
+            
+            if remote_status in ['closed', 'filled', 'canceled', 'expired', 'rejected']:
+                 if local_order:
+                     # Remove from pending to unlock Governor/Executor
+                     if local_order in self.pending_orders:
+                        self.pending_orders.remove(local_order)
+                     print(f"[{self.name}] 🗑️ Cleared Completed Order {order_id} ({remote_status})")
+
+            return {
+                'status': remote_status, 
+                'filled': float(order.get('filled', 0.0)), 
+                'price': float(order.get('average') or order.get('price', 0.0))
+            }
+
+        except Exception as e:
+            print(f"[{self.name}] ⚠️ fetch_order_status failed: {e}")
+            return None
+
     def check_fills(self, candle_low: float = None, candle_high: float = None):
         """
         Check if pending orders were filled. For live, we fetch from exchange.
         """
+        if not self.check_circuit_breaker(): return []
+
         filled_orders = []
         remaining_orders = []
         
@@ -505,11 +827,13 @@ class ActuatorHolon(Holon):
                 try:
                     # We pass symbol to narrow it down if possible
                     open_orders = self.exchange.fetch_open_orders(exec_symbol)
+                    self.report_success()
                     for o in open_orders:
                         if o['id'] == order['id']:
                             found_order = o
                             break
                 except Exception as e:
+                    if "NetworkError" in str(e) or "503" in str(e): self.report_failure(str(e))
                     print(f"[{self.name}] ⚠️ fetch_open_orders failed: {e}")
 
                 # 2. If not found, Check Closed Orders (It might have just filled)
@@ -544,7 +868,7 @@ class ActuatorHolon(Holon):
                         age = time.time() - order['timestamp']
                         
                         # Add jitter to prevent thundering herd on API
-                        timeout = 55 + random.randint(-5, 5)
+                        timeout = 30 + random.randint(0, 5) # NANO FIX: 30s Timeout
                         
                         if age > timeout:
                             try:
@@ -592,6 +916,8 @@ class ActuatorHolon(Holon):
         Fetch Order Book from the EXECUTION VENUE (Kraken Futures etc).
         Crucial for checking liquidity on the exchange we actually trade on.
         """
+        if not self.check_circuit_breaker(): return {'bids': [], 'asks': []}
+
         try:
             # Map Symbol
             exec_symbol = symbol
@@ -599,12 +925,14 @@ class ActuatorHolon(Holon):
                 exec_symbol = config.KRAKEN_SYMBOL_MAP.get(symbol, symbol)
                 
             book = self.exchange.fetch_order_book(exec_symbol, limit)
+            self.report_success()
             return {
                 'bids': book['bids'],
                 'asks': book['asks'],
                 'timestamp': book['timestamp']
             }
         except Exception as e:
+            self.report_failure(str(e))
             print(f"[{self.name}] ⚠️ Actuator Book Fetch Fail {symbol}: {e}")
             return {'bids': [], 'asks': []}
 
@@ -656,6 +984,16 @@ class ActuatorHolon(Holon):
              return order
         except Exception as e:
              # print(f"[{self.name}] ⚠️ Fetch Order Failed: {e}")
+             
+             # Fallback: Check closed orders if fetch_order fails (order might have moved to history)
+             try:
+                 exec_symbol = self.symbol_map.get(symbol, symbol)
+                 closed = self.exchange.fetch_closed_orders(exec_symbol, limit=50) # Increased limit for safety
+                 for o in closed:
+                     if o['id'] == order_id:
+                         return o
+             except: pass
+             
              return None
 
     def check_invariants(self, balance: float, total_exposure: float) -> bool:
@@ -678,3 +1016,49 @@ class ActuatorHolon(Holon):
              return False # HALT
              
         return True
+
+    def check_spread_health(self, symbol: str, ticker: Dict) -> bool:
+        """
+        Spread Veto: Prevent entry if spread > Threshold (0.4%).
+        """
+        if not ticker or 'bid' not in ticker or 'ask' not in ticker:
+            return True # Can't check
+            
+        spread_pct = (ticker['ask'] - ticker['bid']) / ticker['ask'] if ticker['ask'] > 0 else 0.0
+        
+        limit = config.VOL_WINDOW_SPREAD_THRESHOLD # 0.4%
+        
+        if spread_pct > limit:
+            print(f"[{self.name}] 🧊 SPREAD VETO: {symbol} spread {spread_pct*100:.2f}% > {limit*100:.2f}%")
+            return False
+            
+        return True
+        
+    def should_force_close_funding(self, symbol: str, position_dir: str, funding_rate: float) -> bool:
+        """
+        Funding Flip Kill Switch:
+        If we are holding a position primarily for Funding Arb (or just generally),
+        and the funding rate moves against us (we start paying), signal CLOSE.
+        
+        Pos Funding (>0): Longs Pay Shorts.
+        Neg Funding (<0): Shorts Pay Longs.
+        """
+        # If we are Long, we want Neg Funding (Get Paid). If Pos, we Pay.
+        # If we are Short, we want Pos Funding (Get Paid). If Neg, we Pay.
+        
+        if position_dir == 'BUY':
+             # We hold Long. We pay if Funding > 0.
+             # If Funding > 0 and we entered for Arb, we should exit.
+             # But normal trend trading pays funding often.
+             # We assume this check is only called for ARB strategies or if strictly enforcing "Don't Pay Funding".
+             # For VOL_WINDOW, we might be stricter.
+             if funding_rate > 0.0001: # Small buffer
+                 return True
+                 
+        elif position_dir == 'SELL':
+             # We hold Short. We pay if Funding < 0.
+             if funding_rate < -0.0001:
+                 return True
+                 
+        return False
+

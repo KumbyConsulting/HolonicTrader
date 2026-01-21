@@ -28,85 +28,86 @@ class EntropyHolon(Holon):
         default_disposition = Disposition(autonomy=0.7, integration=0.6)
         super().__init__(name=name, disposition=default_disposition)
 
+
     def calculate_shannon_entropy(self, returns_series: pd.Series) -> float:
         """
-        Calculate Shannon Entropy for a given returns series.
-
-        Steps:
-            A. Discretize the input returns_series into 10 fixed bins using np.histogram.
-            B. Calculate probabilities p(x) for each bin.
-            C. Return the Shannon Entropy value (S = -sum(p * log(p))).
-
-        Args:
-            returns_series: A pandas Series of log returns.
-
-        Returns:
-            The Shannon Entropy value (in nats, using natural log).
+        Calculate Shannon Entropy using Rust Engine (Holonic Speed) if available.
+        Fallback to Python/Scipy if not.
         """
-        # Step A: Discretize into 10 bins
-        counts, bin_edges = np.histogram(returns_series, bins=10)
-
-        # Step B: Calculate probabilities (normalize counts)
-        # Sum of probabilities must equal 1
-        total_count = counts.sum()
-        if total_count == 0:
-            # Edge case: no data, return 0 entropy
-            return 0.0
-
-        probabilities = counts / total_count
-
-        # Verification: probabilities should sum to 1
-        # assert np.isclose(probabilities.sum(), 1.0), "Probabilities do not sum to 1!"
-
-        # Step C: Calculate Shannon Entropy using scipy.stats.entropy
-        # scipy.stats.entropy calculates S = -sum(pk * log(pk)) for pk > 0
-        # It handles zero probabilities gracefully (0 * log(0) = 0)
-        shannon_entropy = scipy_entropy(probabilities)
-
-        return float(shannon_entropy)
+        # Try Rust Path (100x Faster)
+        try:
+            import holonic_speed
+            # Rust expects a flat list of floats
+            # We must ensure data is clean (no NaNs/Infs) or Rust might panic/return NaN
+            data = returns_series.dropna().values.tolist()
+            if not data: return 0.0
+            return float(holonic_speed.calculate_shannon_entropy(data))
+            
+        except ImportError:
+            # Fallback to Legacy Python
+            counts, bin_edges = np.histogram(returns_series, bins=10)
+            total_count = counts.sum()
+            if total_count == 0: return 0.0
+            probabilities = counts / total_count
+            return float(scipy_entropy(probabilities))
+        except Exception as e:
+            # Safety Net
+            # print(f"Rust Entropy Error: {e}") 
+            counts, bin_edges = np.histogram(returns_series, bins=10)
+            total_count = counts.sum()
+            if total_count == 0: return 0.0
+            probabilities = counts / total_count
+            return float(scipy_entropy(probabilities))
 
     def calculate_renyi_entropy(self, returns_series: pd.Series, alpha: float = 2.0) -> float:
         """
-        Calculate Rényi Entropy for a given returns series.
-        
-        Formula: H_alpha(X) = (1 / (1 - alpha)) * ln(sum(p_i ^ alpha))
-        
-        Args:
-            returns_series: A pandas Series of log returns.
-            alpha: The order of Rényi entropy. 
-                   alpha=0 -> Max Entropy (Hartley)
-                   alpha=1 -> Shannon Entropy (limit as alpha->1)
-                   alpha=2 -> Collision Entropy (focus on peaks)
-                   alpha=inf -> Min Entropy
-                   
-        Returns:
-            The Rényi Entropy value (in nats).
+        Calculate Rényi Entropy using Rust Engine.
         """
-        # Step A: Discretize (Same as Shannon)
-        counts, _ = np.histogram(returns_series, bins=10)
-        
-        # Step B: Probabilities
-        total_count = counts.sum()
-        if total_count == 0:
+        try:
+            import holonic_speed
+            data = returns_series.dropna().values.tolist()
+            if not data: return 0.0
+            return float(holonic_speed.calculate_renyi_entropy(data, alpha))
+            
+        except ImportError:
+            # Fallback
+            counts, _ = np.histogram(returns_series, bins=10)
+            total_count = counts.sum()
+            if total_count == 0: return 0.0
+            probabilities = counts / total_count
+            if np.isclose(alpha, 1.0):
+                return self.calculate_shannon_entropy(returns_series)
+            sum_p_alpha = np.sum(probabilities ** alpha)
+            if sum_p_alpha == 0: return 0.0
+            return float((1.0 / (1.0 - alpha)) * np.log(sum_p_alpha))
+
+    def calculate_multiscale_entropy(self, returns_series: pd.Series, max_scale: int = 10, m: int = 2) -> list:
+        """
+        AEHML 2.0: Calculate Multiscale Entropy (MSE/RCMWPE).
+        Returns a list of entropy values for scales 1 to max_scale.
+        """
+        try:
+            import holonic_speed
+            data = returns_series.dropna().values.tolist()
+            if not data: return [0.0] * max_scale
+            return holonic_speed.calculate_multiscale_entropy(data, max_scale, m)
+        except Exception as e:
+            print(f"[{self.name}] RCMWPE Error: {e}")
+            # Fallback: Just return naive Shannon repeated or zeros
+            return [self.calculate_shannon_entropy(returns_series)] * max_scale
+
+    def calculate_permutation_entropy(self, returns_series: pd.Series, m: int = 3, delay: int = 1) -> float:
+        """
+        AEHML 2.0: Calculate Permutation Entropy (Structural Complexity).
+        """
+        try:
+            import holonic_speed
+            data = returns_series.dropna().values.tolist()
+            if not data: return 0.0
+            return float(holonic_speed.calculate_permutation_entropy(data, m, delay))
+        except Exception as e:
+            # Fallback? PE is hard to replicate simply in numpy without loop.
             return 0.0
-            
-        probabilities = counts / total_count
-        
-        # Step C: Rényi Calculation
-        # Avoid log(0) issues not needed here as we sum first, but p^alpha is safe for p=0
-        
-        # alpha = 1.0 is a special case (Shannon), but typically handled by separate func or limit.
-        if np.isclose(alpha, 1.0):
-            return self.calculate_shannon_entropy(returns_series)
-            
-        sum_p_alpha = np.sum(probabilities ** alpha)
-        
-        if sum_p_alpha == 0:
-            return 0.0 # Should not happen if total_count > 0
-            
-        renyi_entropy = (1.0 / (1.0 - alpha)) * np.log(sum_p_alpha)
-        
-        return float(renyi_entropy)
 
     def determine_regime(self, entropy_value: float) -> Literal['ORDERED', 'CHAOTIC', 'TRANSITION']:
         """

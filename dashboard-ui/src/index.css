@@ -1,0 +1,26 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-holon-bg text-holon-text font-sans antialiased overflow-hidden;
+  }
+}
+
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+
+/* Custom Scrollbar for Logs */
+.log-scrollbar::-webkit-scrollbar {
+  width: 8px;
+}
+
+.log-scrollbar::-webkit-scrollbar-track {
+  @apply bg-holon-card;
+}
+
+.log-scrollbar::-webkit-scrollbar-thumb {
+  @apply bg-holon-dim rounded;
+}

@@ -1,0 +1,190 @@
+/* Dashboard Styles - Extracted from dashboard.html */
+:root {
+    --bg-dark: #0a0b10;
+    --bg-card: #13151f;
+    --bg-hover: #1c2030;
+    --accent-primary: #8b5cf6; /* Violet */
+    --accent-cyan: #06b6d4;
+    --accent-green: #10b981;
+    --accent-red: #ef4444;
+    --accent-yellow: #f59e0b;
+    --text-main: #e2e8f0;
+    --text-dim: #64748b;
+    --border: #2d3748;
+}
+
+body {
+    background-color: var(--bg-dark);
+    color: var(--text-main);
+    font-family: 'Inter', sans-serif;
+    overflow-x: hidden;
+    font-size: 0.95rem;
+}
+
+/* Typography */
+h1, h2, h3, h4, .brand-font {
+    font-family: 'Orbitron', sans-serif;
+    font-weight: 700;
+    letter-spacing: 1px;
+}
+
+.mono-font {
+    font-family: 'JetBrains Mono', monospace;
+}
+
+/* Premium Card */
+.glass-card {
+    background: rgba(19, 21, 31, 0.7);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: 12px;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
+    transition: all 0.3s ease;
+}
+
+.glass-card:hover {
+    border-color: rgba(139, 92, 246, 0.3);
+    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5);
+}
+
+/* Sidebar/Grid Layout */
+.dashboard-container {
+    max-width: 1800px;
+    margin: 0 auto;
+    padding: 20px;
+}
+
+/* Status Indicator Pulse */
+@keyframes pulse-green {
+    0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
+    70% { box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+}
+
+@keyframes pulse-red {
+    0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
+    70% { box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+}
+
+.status-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    display: inline-block;
+    margin-right: 8px;
+}
+
+.status-dot.active {
+    background-color: var(--accent-green);
+    animation: pulse-green 2s infinite;
+}
+
+.status-dot.stopped {
+    background-color: var(--accent-red);
+    box-shadow: 0 0 5px var(--accent-red);
+}
+
+/* Terminal Log */
+.terminal-window {
+    height: 400px;
+    overflow-y: auto;
+    background: #000;
+    border: 1px solid #333;
+    border-radius: 8px;
+    padding: 15px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.85rem;
+    color: #ccc;
+}
+
+.log-entry {
+    margin-bottom: 2px;
+    border-left: 2px solid transparent;
+    padding-left: 5px;
+}
+
+.log-entry:hover {
+    background: #111;
+}
+
+.log-entry.error {
+    color: var(--accent-red);
+    border-left-color: var(--accent-red);
+}
+
+.log-entry.warn {
+    color: var(--accent-yellow);
+    border-left-color: var(--accent-yellow);
+}
+
+.log-entry.success {
+    color: var(--accent-green);
+    border-left-color: var(--accent-green);
+}
+
+/* Table Styling */
+.table-dark {
+    background: transparent;
+}
+
+.table-dark th {
+    color: var(--text-dim);
+    font-weight: 600;
+    text-transform: uppercase;
+    font-size: 0.75rem;
+    letter-spacing: 1px;
+    border-bottom: 1px solid var(--border);
+}
+
+.table-dark td {
+    border-bottom: 1px solid #1f2937;
+    vertical-align: middle;
+}
+
+/* Animations */
+.fade-in-up {
+    animation: fadeInUp 0.5s ease-out forwards;
+    opacity: 0;
+    transform: translateY(20px);
+}
+
+@keyframes fadeInUp {
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.delay-1 { animation-delay: 0.1s; }
+.delay-2 { animation-delay: 0.2s; }
+.delay-3 { animation-delay: 0.3s; }
+
+/* Buttons */
+.btn-neon {
+    background: transparent;
+    border: 1px solid var(--accent-primary);
+    color: var(--accent-primary);
+    text-transform: uppercase;
+    font-family: 'Orbitron', sans-serif;
+    font-size: 0.8rem;
+    padding: 8px 20px;
+    transition: 0.3s;
+}
+
+.btn-neon:hover {
+    background: var(--accent-primary);
+    color: white;
+    box-shadow: 0 0 15px var(--accent-primary);
+}
+
+.btn-panic {
+    border-color: var(--accent-red);
+    color: var(--accent-red);
+}
+
+.btn-panic:hover {
+    background: var(--accent-red);
+    color: white;
+    box-shadow: 0 0 15px var(--accent-red);
+}

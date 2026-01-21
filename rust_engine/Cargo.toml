@@ -1,0 +1,14 @@
+[package]
+name = "holonic_speed"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "holonic_speed"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23.3", features = ["extension-module"] }
+rayon = "1.10"
+sha2 = "0.10"
+# ort = "2.0.0-rc.11"  # BLOCKED: Requires pre-built ONNX Runtime on Windows

@@ -18,9 +18,10 @@ import os
 console = Console(file=sys.__stdout__, force_terminal=True, width=120)
 
 from HolonicTrader.holon_core import Holon, Disposition, Message
-from HolonicTrader.agent_executor import TradeSignal
+from HolonicTrader.agent_executor import TradeSignal, TradeDecision
 from performance_tracker import get_performance_data
 import config
+from HolonicTrader.agent_trinity import TrinityStrategy # NEW: Phase 46
 
 class TraderHolon(Holon):
     """
@@ -39,10 +40,20 @@ class TraderHolon(Holon):
         
         # Scout State
         self.scout_last_run = 0.0
+        self.scout_results = {} # Cache for scout findings
+        self.scout_active_list = [] # Persistent Scout Findings
         self.active_session_whitelist = config.ACTIVE_WATCHLIST.copy() # Start with Hot List
         self._load_whitelist_from_disk()
         
+        # Evolution Engine Watcher
+        self.last_genome_mtime = 0
+        
         self.verbose_logging = True # Request C: Enable transparency logs
+        
+        # Phase 46: Trinity Strategy
+        self.trinity = TrinityStrategy()
+
+        self.cycle_counter = 0 # General cycle counter (Phase 46 Fix)
 
     def _load_whitelist_from_disk(self):
         import json
@@ -79,6 +90,32 @@ class TraderHolon(Holon):
         except Exception as e:
             print(f"[{self.name}] ⚠️ Failed to sync scout status: {e}")
 
+    def _scan_for_genome_updates(self):
+        """Monitor for new strategies from the Evolution Engine."""
+        try:
+            path = os.path.join(os.getcwd(), 'live_genome.json')
+            if os.path.exists(path):
+                mtime = os.path.getmtime(path)
+                if mtime > self.last_genome_mtime:
+                    # New Genome detected
+                    try:
+                        import json
+                        with open(path, 'r') as f:
+                            data = json.load(f)
+                            equity = data.get('final_equity', 0)
+                            roi = data.get('roi', 0)
+                            
+                        # Only log if we have seen a previous version (avoid startup spam if older)
+                        # Or just log every time it changes
+                        if self.last_genome_mtime > 0:
+                            print(f"[{self.name}] 🧬 SYSTEM UPGRADE: New Genome Active! (Sim ROI: {roi*100:.1f}%, Eq: ${equity:.2f})")
+                        
+                        self.last_genome_mtime = mtime
+                    except Exception as e:
+                        print(f"[{self.name}] ⚠️ Genome Read Error: {e}")
+        except Exception as e:
+            pass
+
     def _run_scout_cycle(self):
         """
         The Slow Loop: Scans the Cold List for opportunities to promote.
@@ -103,11 +140,11 @@ class TraderHolon(Holon):
             personality = oracle.profile_asset_class(symbol, ticker_data)
             scout_results[symbol] = personality
             
-            if symbol in self.active_session_whitelist: continue # Already active
+            if symbol in self.scout_active_list: continue # Already active
             
             if personality in ['ROCKET', 'ANCHOR']:
                 print(f"[{self.name}] 🚀 SCOUT PROMOTION: {symbol} identified as {personality}. Adding to Active Loop.")
-                self.active_session_whitelist.append(symbol)
+                self.scout_active_list.append(symbol)
                 promoted_count += 1
         
         # Sync Status for GUI
@@ -118,7 +155,10 @@ class TraderHolon(Holon):
             
         self.scout_last_run = time.time()
         self.last_ppo_reward = 0.0
+        self.scout_last_run = time.time()
+        self.last_ppo_reward = 0.0
         self.gc_cycle_counter = 0  # GC Monitor cycle counter
+        self.cycle_counter = 0 # General cycle counter (Phase 46 Fix)
 
     def register_agent(self, role: str, agent: Holon):
         self.sub_holons[role] = agent
@@ -135,18 +175,66 @@ class TraderHolon(Holon):
                 print(f"[{self.name}] ❌ OBSERVER HEALTH FAIL: {e}")
 
     def run_cycle(self):
+        self.cycle_counter += 1
         self.perform_health_check()
         
-        # --- PATCH 1: THE KILL SWITCH (Connect the Brakes) ---
+        executor = self.sub_holons.get('executor')
         monitor = self.sub_holons.get('monitor')
-        if monitor:
-            is_healthy, risk_msg = monitor.check_vital_signs()
+        governor = self.sub_holons.get('governor') # Moved up for Balance Sync Patch
+        
+        # --- PATCH 2: SAFETY-FIRST LOOP ORDERING (Resilience Update) ---
+        # 1. Check Connectivity & Equity Status
+        current_equity = None
+        blind_mode = False
+        
+        if executor and executor.actuator:
+             # Circuit Breaker Check is implicit in Actuator calls
+             current_equity = executor.actuator.get_equity()
+             
+             # --- PATCH: CRITICAL BALANCE SYNC ---
+             # We must sync BOTH Equity and Free Margin to Governor/Executor
+             # to prevent "Insufficient Funds" errors due to drift.
+             free_margin = executor.actuator.get_account_balance()
+             
+             if current_equity is not None and free_margin is not None:
+                 if governor:
+                     governor.set_live_balance(current_equity, free_margin)
+                 if executor:
+                     executor.sync_balance(current_equity) # Updates DB and Internal
+                     
+                 # Also update Monitor if present
+                 if monitor:
+                     monitor.metrics['current_equity'] = current_equity
+             # ------------------------------------
+             
+             if current_equity is None:
+                 print(f"[{self.name}] ⚠️ BLIND MODE: Cannot fetch Equity (API/Network Issue). Skipping Entry Logic.")
+                 blind_mode = True
+                 # If we are blind, we generally shouldn't trade, but maybe we can manage exits?
+                 # Safest is to skip entries but allow exits if Order Book allows.
+                 # But if Actuator is down, we can't do anything.
+                 if getattr(executor.actuator, 'circuit_open', False):
+                     print(f"[{self.name}] 💤 API CIRCUIT OPEN. Skipping Cycle.")
+                     time.sleep(10) 
+                     return []
+        
+        # 2. IMMEDIATE HEALTH CHECK (The Fever Check)
+        if monitor and current_equity:
+            is_healthy, risk_msg = monitor.perform_live_check(current_equity)
             if not is_healthy:
                 print(f"[{self.name}] 🛑 CRITICAL HEALTH LOCKDOWN: {risk_msg}")
                 print(f"[{self.name}] 💤 HIBERNATING for 4 hours to cool down...")
                 time.sleep(14400) # 4 Hour Hard Sleep
                 return [] # Skip cycle
-                
+        
+        # 3. Old Check (Backup)
+        if monitor:
+             is_healthy_old, _ = monitor.check_vital_signs()
+             if not is_healthy_old:
+                 print(f"[{self.name}] 🛑 HEALTH LOCKDOWN (Persistent State). Skipping.")
+                 return []
+        # -------------------------------------------------------------
+        
         interval = getattr(self, '_active_interval', 60)
         print(f"\n[{self.name}] --- Starting Warp Cycle (Interval: {interval}s) ---") 
         
@@ -156,14 +244,14 @@ class TraderHolon(Holon):
 
         oracle = self.sub_holons.get('oracle')
         observer = self.sub_holons.get('observer')
-        executor = self.sub_holons.get('executor')
+        # executor fetched above
         governor = self.sub_holons.get('governor')
         ppo = self.sub_holons.get('ppo')
         guardian = self.sub_holons.get('guardian')
-        monitor = self.sub_holons.get('monitor')
+        # monitor fetched above
         sentiment = self.sub_holons.get('sentiment')
-        overwatch = self.sub_holons.get('overwatch') # <--- Get Overwatch Ref
-        regime_controller = self.sub_holons.get('regime') # <--- Phase 7
+        overwatch = self.sub_holons.get('overwatch') 
+        regime_controller = self.sub_holons.get('regime')
 
         # --- PHASE -2: REGIME STATE UPDATE ---
         if regime_controller and executor:
@@ -183,6 +271,10 @@ class TraderHolon(Holon):
         # --- PHASE -1: OVERWATCH AUDIT (The Sentry) ---
         if overwatch:
             overwatch.perform_audit()
+            
+        # Evolution Watcher
+        self._scan_for_genome_updates()
+        
         self._run_scout_cycle()
 
         # --- PHASE 0: PARALLEL PRE-FLIGHT (GMB Sync) ---
@@ -203,6 +295,29 @@ class TraderHolon(Holon):
                 greed = getattr(governor, 'risk_multiplier', 1.0)
             oracle.set_emotional_bias(fear, greed)
             
+            # Pass Sentiment Score to Oracle & Get Bias
+            oracle.set_emotional_bias(fear, greed)
+            global_bias = oracle.get_market_bias(sentiment_score=sent_score)
+            
+            # --- PHASE 46: TRINITY ASSET ROTATION ---
+            # 1. Determine Market Regime (from History/Entropy)
+            m_regime = self.market_state.get('regime', 'TRANSITION')
+            btc_trend = 'BULL' if global_bias >= 0.50 else 'BEAR'
+            
+            # 2. Get Targets from Trinity Strategy
+            trinity_targets = self.trinity.get_allocation_target(m_regime, btc_trend)
+            
+            # 3. Update Whitelist (Dynamic Focus)
+            # Only trade what the strategy wants + Any open positions (to manage exits)
+            open_positions = []
+            if executor: open_positions = list(executor.held_assets.keys())
+            
+            # Merge and Dedup (Trinity + OpenPositions + ScoutRockets)
+            target_list = list(trinity_targets.keys()) + open_positions + self.scout_active_list
+            self.active_session_whitelist = list(set(target_list))
+            
+            print(f"[{self.name}] 🧘 Trinity Rotation: {m_regime} | {btc_trend} -> Focus: {list(trinity_targets.keys())} (+{len(self.scout_active_list)} Scout Items)")
+            
             # OPTIMIZATION: Parallel Batch Fetch via Observer
             target_assets = self.active_session_whitelist
             batch_data = observer.fetch_market_data_batch(target_assets, limit=100)
@@ -215,6 +330,37 @@ class TraderHolon(Holon):
                     oracle.get_kalman_estimate(sym, data)
                 except: pass
             
+
+            
+            # --- PACK HUNT DATA PREP ---
+            # Calculate 24h % Change for all assets to find Alpha/Beta dispersion
+            pack_changes = []
+            self.session_ticker_data = {} # Store for _analyze_asset lookup
+            
+            for sym, d in batch_data.items():
+                if len(d) >= 90: # Need approx 24h data (96 bars of 15m)
+                    try:
+                        # Use first available bar if < 96, else -96
+                        start_idx = -96 if len(d) >= 96 else 0
+                        start_p = d['close'].iloc[start_idx]
+                        end_p = d['close'].iloc[-1]
+                        if start_p > 0:
+                            pct_change = ((end_p - start_p) / start_p) * 100.0
+                            pack_changes.append(pct_change)
+                            self.session_ticker_data[sym] = {'percentage': pct_change}
+                    except: pass
+            
+            if pack_changes:
+                pack_arr = np.array(pack_changes)
+                self.session_pack_stats = {
+                    'mean': float(np.mean(pack_arr)),
+                    'std': float(np.std(pack_arr))
+                }
+                # print(f"[{self.name}] 🐺 PACK STATS: Mean {self.session_pack_stats['mean']:.2f}% | Std {self.session_pack_stats['std']:.2f}%")
+            else:
+                self.session_pack_stats = {'mean': 0.0, 'std': 1.0}
+            # ---------------------------
+
             # Pass Sentiment Score to Oracle
             global_bias = oracle.get_market_bias(sentiment_score=sent_score)
             print(f"[{self.name}] 📊 GLOBAL BIAS: {global_bias:.2f} (Sentiment: {sent_score:+.2f})")
@@ -240,6 +386,7 @@ class TraderHolon(Holon):
             symbol, data, current_price = res['symbol'], res['data'], res['price']
             row_data, indicators = res['row_data'], res['indicators']
             entropy_val, regime = res['entropy_val'], res['regime']
+            tda_score, tda_status = res.get('tda_score', 0.5), res.get('tda_status', 'STABLE')
             
             if entropy_val > 0: entropies.append(entropy_val)
 
@@ -256,6 +403,28 @@ class TraderHolon(Holon):
                         executor.latest_prices,
                         position_metadata=executor.position_metadata
                     )
+                    
+                    # --- PATCH: DRAWDOWN EMERGENCY LIQUIDATION ---
+                    # If Drawdown Lock is active, aggressively cut losing positions
+                    if governor.drawdown_lock:
+                         for pos_sym, pos_data in governor.positions.items():
+                             if pos_sym in to_close: continue
+                             
+                             entry_p = pos_data.get('entry_price', 0)
+                             curr_p = executor.latest_prices.get(pos_sym, entry_p)
+                             direction = pos_data.get('direction', 'BUY')
+                             
+                             if entry_p > 0:
+                                 if direction == 'BUY':
+                                     pnl = (curr_p - entry_p) / entry_p
+                                 else:
+                                     pnl = (entry_p - curr_p) / entry_p
+                                     
+                                 if pnl < -0.01: # -1% Loss Threshold (Quick Cut)
+                                     print(f"[{self.name}] 🚨 DRAWDOWN EMERGENCY: Liquidating Loser {pos_sym} (PnL {pnl:.2%}) due to Lock.")
+                                     to_close.append(pos_sym)
+                    # ---------------------------------------------
+                    
                     for c_sym in to_close:
                         print(f"[{self.name}] 🧹 EXECUTING CONSOLIDATION CLOSE: {c_sym}")
                         direction = executor.position_metadata.get(c_sym, {}).get('direction', 'BUY')
@@ -268,8 +437,7 @@ class TraderHolon(Holon):
                         print(f"[{self.name}] 🔍 CONSOLIDATION DEBUG: Sym={c_sym}, Held={real_holding}, CloseQty={close_qty:.8f}")
                         
                         # Construct proper TradeSignal and TradeDecision for Executor
-                        from HolonicTrader.agent_executor import TradeSignal, TradeDecision
-                        from HolonicTrader.holon_core import Disposition
+                        # Imports moved to global scope
                         
                         close_signal = TradeSignal(
                             symbol=c_sym,
@@ -318,55 +486,139 @@ class TraderHolon(Holon):
 
                 # A. Handle Entry
                 entry_sig = res.get('entry_signal') if not (regime_controller and regime_controller.is_transition_pending()) else None
+                
+                # --- PATCH: HARD TOPOLOGY VETO ---
+                if tda_status == 'CRITICAL' and entry_sig:
+                     print(f"[{self.name}] 🚨 TOPOLOGY HARD VETO: Structure Collapse detected for {symbol}. Blocking Entry.")
+                     entry_sig = None
+                # ---------------------------------
+                
+                # BLIND MODE GUARD: No Entries if we count not verify Equity
+                if blind_mode: entry_sig = None
+                
                 if entry_sig and executor and governor and oracle:
                     pnl_tracker = get_performance_data()
                     atr_ref = indicators['tr'].rolling(14).mean().rolling(14).mean().iloc[-1]
                     atr_ratio = min(2.0, indicators['atr'] / atr_ref) if atr_ref > 0 else 1.0
                     gov_health = governor.get_portfolio_health()
                     
+                    # AEHML 2.0: PPO State Expansion (Now 8-Dim)
+                    # [Regime_ID, Entropy, WinRate, ATR_Ratio, Drawdown, Margin, TDA_Score, RCMWPE_Regime]
+                    
+                    # Ensure we have the new metrics from row_data context or analysis loop
+                    tda_score_val = tda_score if 'tda_score' in locals() else 0.5 
+                    if tda_status == 'CRITICAL': tda_score_val = 0.0 # Force low score for crash
+                    
+                    # RCMWPE Regime: 0=Safe, 1=Complex/Transitions
+                    # Approximation: Use Entropy Regime ID for now, or assume 0.5 if unknown
+                    
                     ppo_state = np.array([
-                        {'ORDERED': 0.0, 'TRANSITION': 0.5, 'CHAOTIC': 1.0}.get(regime, 0.5),
-                        entropy_val, pnl_tracker.get('win_rate', 0.5), atr_ratio, 
-                        gov_health['drawdown_pct'], gov_health['margin_utilization']
+                        {'ORDERED': 0.0, 'TRANSITION': 0.5, 'CHAOTIC': 1.0}.get(regime, 0.5), # Legacy Regime
+                        entropy_val, 
+                        pnl_tracker.get('win_rate', 0.5), 
+                        atr_ratio, 
+                        gov_health['drawdown_pct'], 
+                        gov_health['margin_utilization'],
+                        tda_score_val, # NEW
+                        0.5 # Placeholder for RCMWPE specific feature
                     ], dtype=np.float32)
 
                     conviction = ppo.get_conviction(ppo_state) if ppo else 0.5
                     self.last_ppo_conviction = conviction
                     entry_sig.metadata = {'ppo_state': ppo_state.tolist(), 'ppo_conviction': conviction, 'atr': indicators['atr']}
 
-                    approved, safe_qty, leverage = governor.calc_position_size(
-                        symbol, current_price, indicators['atr'], atr_ref, conviction, 
-                        direction=entry_sig.direction, sentiment_score=sent_score
-                    )
+                    # --- NOISE REDUCTION: Signal Deduplication ---
+                    # Prevent spamming "EXECUTING ENTRY" or "GOVERNOR VETO" for the same signal 15x times
+                    # Checks: Symbol, Direction, and Time (< 5 mins since last attempt)
+                    
+                    sig_key = f"{symbol}_{entry_sig.direction}"
+                    last_attempt = getattr(self, 'last_signal_attempts', {}).get(sig_key, 0)
+                    now_ts = time.time()
+                    
+                    # If tried < 2 mins ago, skip silently (unless price moved > 1%)
+                    # We initialize the dict in __init__ ideally, but using getattr is safe patch
+                    if not hasattr(self, 'last_signal_attempts'): self.last_signal_attempts = {}
+                    
+                    if (now_ts - last_attempt) < 120: # 2 Minute Cooldown on Retries
+                         # Silent Skip
+                         entry_sig = None
+                    else:
+                         # --- DEBOUNCE CHECK (Optimization #1) ---
+                         # Check if price has moved enough from LAST ENTRY to justify disturbing the Governor
+                         # This prevents "Stack Too Close" log spam
+                         should_skip_governor = False
+                         if governor:
+                             pos_data = governor.positions.get(symbol)
+                             if pos_data:
+                                 last_entry_price = pos_data.get('entry_price', 0.0)
+                                 # Calculate distance
+                                 if last_entry_price > 0:
+                                     dist_pct = abs(current_price - last_entry_price) / last_entry_price
+                                     # Use the same threshold as Governor uses for stacking
+                                     min_dist = getattr(config, 'GOVERNOR_MIN_STACK_DIST', 0.002) 
+                                     
+                                     if dist_pct < min_dist:
+                                         # Too close. Governor WILL reject this.
+                                         # So we skip calling it to save logs.
+                                         # entry_sig = None # Don't kill signal, just mark to skip? No, kill it.
+                                         entry_sig = None
+                                         # Only log sparsely (e.g. if we haven't logged this in a while?)
+                                         # actually, silently skipping is the goal of debounce.
+                                         # But maybe debug print if verbose?
+                                         # print(f"[{self.name}] 🤫 Debouncing {symbol}: Price change {dist_pct:.2%} < {min_dist:.2%}")
+                                         pass
+
+                         pass
+
+                    if entry_sig:
+                        is_whale = entry_sig.metadata.get('is_whale', False)
+                        
+                        approved, safe_qty, leverage = governor.calc_position_size(
+                            symbol, current_price, indicators['atr'], atr_ref, conviction, 
+                            direction=entry_sig.direction, sentiment_score=sent_score,
+                            whale_confirmed=is_whale
+                        )
+                    else:
+                        approved = False
+                        safe_qty = 0
+                        leverage = 1.0
 
                     if approved and safe_qty > 0:
                         entry_sig.size = safe_qty
                         decision = executor.decide_trade(entry_sig, regime, entropy_val)
                         if decision.action != 'HALT':
                             print(f"[{self.name}] 🎯 EXECUTING ENTRY: {symbol} (Qty: {safe_qty:.4f}, Lev: {leverage}x)")
-                            executor.execute_transaction(decision, current_price)
                             
-                            # --- PATCH: NOTIFY GOVERNOR (Update Timestamps/Stacks) ---
-                            # Critical for Cooldown and Stack Distance Logic
-                            if governor:
-                                direction = entry_sig.direction
-                                governor.open_position(symbol, direction, current_price, safe_qty)
-                            # ---------------------------------------------------------
+                            # Update Debounce Timestamp (We tried!)
+                            self.last_signal_attempts[sig_key] = time.time()
                             
-                            # Safe Telegram Notification
-                            telegram = self.sub_holons.get('telegram')
-                            if telegram and hasattr(telegram, 'send_message'):
-                                msg = f"🚀 **ENTRY** {symbol}\nPrice: {current_price}\nSize: {entry_sig.size:.4f}"
-                                telegram.send_message(msg)
+                            pnl_res = executor.execute_transaction(decision, current_price)
+                            
+                            if pnl_res is not None:
+                                # --- PATCH: NOTIFY GOVERNOR (Update Timestamps/Stacks) ---
+                                # Critical for Cooldown and Stack Distance Logic
+                                if governor:
+                                    direction = entry_sig.direction
+                                    governor.open_position(symbol, direction, current_price, safe_qty)
+                                # ---------------------------------------------------------
                                 
-                            row_data['Action'] = f"BUY ({res['metabolism']})"
-                            
-                            # Log specific reason
-                            reason_tag = entry_sig.metadata.get('reason', 'TREND')
-                            if entry_sig.metadata.get('is_whale'):
-                                row_data['Action'] = f"WHALE BUY 🐋"
+                                # Safe Telegram Notification (Overwatch)
+                                overwatch = self.sub_holons.get('overwatch')
+                                if overwatch and hasattr(overwatch, 'send_telegram_alert'):
+                                    msg = f"🚀 **ENTRY** {symbol}\nPrice: {current_price}\nSize: {entry_sig.size:.4f}"
+                                    overwatch.send_telegram_alert(msg)
+
+                                row_data['Action'] = f"BUY ({res['metabolism']})"
+                                
+                                # Log specific reason
+                                reason_tag = entry_sig.metadata.get('reason', 'TREND')
+                                if entry_sig.metadata.get('is_whale'):
+                                    row_data['Action'] = f"WHALE BUY 🐋"
+                                else:
+                                    row_data['Action'] = f"BUY ({reason_tag})"
                             else:
-                                row_data['Action'] = f"BUY ({reason_tag})"
+                                print(f"[{self.name}] ⚠️ ENTRY ABORTED: {symbol} (Execution Failed/Unconfirmed). Governor NOT updated.")
+                                row_data['Action'] = "BUY (FAILED)"
                         else:
                             print(f"[{self.name}] 🛑 ENTRY HALTED: {symbol} (Executor HALT)")
                             row_data['Action'] = "BUY (HALT)"
@@ -424,20 +676,13 @@ class TraderHolon(Holon):
                     thesis_exit = TradeSignal(symbol, exit_dir, 1.0, current_price)
                 # -----------------------------------------------------
 
-                hard_exit_type = executor.check_stop_loss_take_profit(symbol, current_price) if executor else None
+                # hard_exit_type removed (Redundant)
                 
                 final_exit = None
                 reason = "IDLE"
                 if thesis_exit:
                     final_exit = thesis_exit
                     reason = "Thesis"
-                elif hard_exit_type:
-                    # FIX: Dynamic Exit Direction
-                    ex_meta = executor.position_metadata.get(symbol, {})
-                    direction = ex_meta.get('direction', 'BUY')
-                    exit_dir = 'BUY' if direction == 'SELL' else 'SELL'
-                    final_exit = TradeSignal(symbol, exit_dir, 1.0, current_price)
-                    reason = hard_exit_type
                 elif guardian_exit:
                     final_exit = guardian_exit
                     reason = "Strat"
@@ -495,7 +740,13 @@ class TraderHolon(Holon):
                                 if time_factor < 1.0: time_factor = 1.0 # Floor at 1
                                 
                                 if is_win:
-                                    reward = reward / time_factor # Fast wins > Slow wins
+                                    # STRATEGY ALIGNMENT: Scalp-to-Pyramid
+                                    # If short duration (< 60m), reward velocity (Scalp).
+                                    # If long duration (> 60m), do NOT penalize (Pyramid/Trend).
+                                    if duration_mins < 60:
+                                        reward = reward / time_factor # Fast wins > Slow scalps
+                                    else:
+                                        reward = reward # Pure PnL for Trend Following (Don't punish patience)
                                 else:
                                     reward = reward * time_factor # Long losses > Fast losses (Double Pain)
 
@@ -525,11 +776,11 @@ class TraderHolon(Holon):
                                 state = np.array(meta['ppo_state']) 
                                 ppo.remember(state, meta['ppo_conviction'], reward, 0.0, 0.0, True)
 
-                        # Safe Telegram Notification
-                        telegram = self.sub_holons.get('telegram')
-                        if telegram and hasattr(telegram, 'send_message'):
+                        # Safe Telegram Notification (Overwatch)
+                        overwatch = self.sub_holons.get('overwatch')
+                        if overwatch and hasattr(overwatch, 'send_telegram_alert'):
                             msg = f"📉 **EXIT** {symbol}\nPrice: {current_price}\nPnL: {pnl_res*100:+.2f}% ({reason})"
-                            telegram.send_message(msg)
+                            overwatch.send_telegram_alert(msg)
 
                         row_data['Action'] = f"SELL ({reason})"
 
@@ -583,7 +834,7 @@ class TraderHolon(Holon):
                 time.sleep(5)
 
         # Run Overwatch Audit
-        if 'overwatch' in self.sub_holons:
+        if self.sub_holons.get('overwatch'):
             try: self.sub_holons['overwatch'].perform_audit()
             except Exception as e: print(f"[{self.name}] ⚠️ Overwatch Error: {e}")
 
@@ -596,9 +847,22 @@ class TraderHolon(Holon):
             try: data = observer.fetch_market_data(limit=100, symbol=symbol)
             except: return None
         if data is None: return None
+        
+        # SAFETY CHECK: Ensure columns exist
+        required_cols = ['close', 'high', 'low', 'open', 'volume']
+        if not all(col in data.columns for col in required_cols):
+             print(f"[{self.name}] ⚠️ Data Validation Error for {symbol}. Missing Columns. Keys: {data.columns.tolist()}")
+             return None
 
         row_data = {'Symbol': symbol, 'Price': f"{data['close'].iloc[-1]:.4f}", 'Regime': '?', 'Action': 'HOLD', 'PnL': '-', 'Note': ''}
         current_price = data['close'].iloc[-1]
+        
+        # PROFILING LOG (User Request)
+        if symbol in ['SOL/USDT', 'XRP/USDT', 'BTC/USDT', 'XTZ/USDT', 'TBTC/USDT']:
+             # Quick peek at Scout personality if available
+             scout_res = getattr(self, 'scout_results', {})
+             pers = scout_res.get(symbol, "Unknown")
+             print(f"[{self.name}] 🕵️ PROFILING {symbol}: Price ${current_price:.2f} | Personality: {pers} | Rows: {len(data)}")
         
         # --- PATCH: MULTI-TIMEFRAME & POLYMARKET CONTEXT ---
         # 1. Calculate Minutes into Candle (15m)
@@ -625,12 +889,24 @@ class TraderHolon(Holon):
         
 
         
+        
         entropy_agent, oracle = self.sub_holons.get('entropy'), self.sub_holons.get('oracle')
         guardian, governor = self.sub_holons.get('guardian'), self.sub_holons.get('governor')
         executor = self.sub_holons.get('executor')
+        topology = self.sub_holons.get('topology') # <--- AEHML 2.0
         
+        # 3. Calculate Entropy & Regime
+        entropy_val = 0.0
+        regime = 'TRANSITION'
+        tda_score = 0.5
+        tda_status = 'STABLE'
+
         if entropy_agent:
-            entropy_val = entropy_agent.calculate_shannon_entropy(data['returns'])
+            # Note: Using calculated returns from indicators usually, but here calculating fresh?
+            # Let's assume data['close'] is Series.
+            # Efficiency: Calculate returns once
+            returns = data['close'].pct_change().dropna()
+            entropy_val = entropy_agent.calculate_shannon_entropy(returns)
             regime = entropy_agent.determine_regime(entropy_val)
             row_data['Entropy'], row_data['Regime'] = f"{entropy_val:.3f}", regime
             
@@ -639,23 +915,62 @@ class TraderHolon(Holon):
             structure_ctx['entropy_regime'] = regime
             # -----------------------------------------------------
 
-        # Structure Scan (Fractals)
-        if oracle:
+        # AEHML 2.0: Topological Check
+        if topology:
+            tda_res = topology.analyze_structure(data)
+            tda_score = tda_res.get('score', 0.5)
+            tda_status = tda_res.get('status', 'STABLE')
+            
+            # If topology is collapsing, override regime display to warn user
+            if tda_status == 'CRITICAL':
+                row_data['Regime'] = f"CRASH WARNING (TDA {tda_score:.2f})"
+                structure_ctx['tda_critical'] = True
+
+        # Structure Scan (CTKS Integration)
+        structure = self.sub_holons.get('structure')
+        if structure:
+             ctx = structure.get_structural_context(symbol, observer)
+             structure_ctx.update(ctx)
+             row_data['Struct'] = f"{ctx.get('sls_zone', 'N')}" # Display Zone
+        elif oracle:
+             # Fallback (Legacy)
              base_ctx = oracle.get_structural_context(symbol, data, current_price) if hasattr(oracle, 'get_structural_context') else {}
              structure_ctx.update(base_ctx)
-             row_data['Struct'] = structure_ctx.get('structure_mode', '?')
 
-        # Indicators
-        delta = data['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        row_data['RSI'] = f"{(100 - (100 / (1 + (gain / loss))).iloc[-1]):.1f}"
-
-        rolling_mean, rolling_std = data['close'].rolling(20).mean(), data['close'].rolling(20).std()
-        bb_vals = {'upper': (rolling_mean + 2*rolling_std).iloc[-1], 'middle': rolling_mean.iloc[-1], 'lower': (rolling_mean - 2*rolling_std).iloc[-1]}
-        
+        # Indicators (RUST ACCELERATED)
+        # Common Indicators (calculated globally to fix UnboundLocalError)
         tr = pd.concat([(data['high']-data['low']), (data['high']-data['close'].shift()).abs(), (data['low']-data['close'].shift()).abs()], axis=1).max(axis=1)
-        atr = tr.rolling(14).mean().iloc[-1]
+
+        try:
+            import holonic_speed
+            
+            closes_list = data['close'].values.tolist()
+            highs_list = data['high'].values.tolist()
+            lows_list = data['low'].values.tolist()
+            
+            rsi_series = holonic_speed.calculate_rsi(closes_list, 14)
+            data['rsi'] = rsi_series[-len(data):]
+            rsi_val = rsi_series[-1]
+            
+            bb_u, bb_m, bb_l = holonic_speed.calculate_bollinger_bands(closes_list, 20, 2.0)
+            bb_vals = {'upper': bb_u[-1], 'middle': bb_m[-1], 'lower': bb_l[-1]}
+            
+            atr_series = holonic_speed.calculate_atr(highs_list, lows_list, closes_list, 14)
+            atr = atr_series[-1]
+            
+            row_data['RSI'] = f"{rsi_val:.1f}"
+
+        except ImportError:
+            # Fallback to Pandas (Legacy)
+            delta = data['close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+            row_data['RSI'] = f"{(100 - (100 / (1 + (gain / loss))).iloc[-1]):.1f}"
+
+            rolling_mean, rolling_std = data['close'].rolling(20).mean(), data['close'].rolling(20).std()
+            bb_vals = {'upper': (rolling_mean + 2*rolling_std).iloc[-1], 'middle': rolling_mean.iloc[-1], 'lower': (rolling_mean - 2*rolling_std).iloc[-1]}
+            
+            atr = tr.rolling(14).mean().iloc[-1]
         
         obv = (np.sign(data['close'].diff()).fillna(0) * data['volume']).cumsum()
         obv_slope, _, _, _, _ = linregress(np.arange(14), obv.iloc[-14:].values)
@@ -664,25 +979,69 @@ class TraderHolon(Holon):
         
         entry_sig = None
         if (not governor or governor.is_trade_allowed(symbol, current_price)) and oracle:
+            pass # Continue to logic below
+        else:
+             if governor and not governor.is_trade_allowed(symbol, current_price):
+                 print(f"[{self.name}] 🛑 GOVERNOR PRE-CHECK VETO for {symbol}: Trade Disallowed (Cooldown/Stack/Funds).")
+                 
+        if (not governor or governor.is_trade_allowed(symbol, current_price)) and oracle:
             last_exit = guardian.last_exit_times.get(symbol) if guardian else None
-            last_exit = guardian.last_exit_times.get(symbol) if guardian else None
-            if not (last_exit and (time.time() - last_exit) < (config.STRATEGY_POST_EXIT_COOLDOWN_CANDLES * 3600)):
-                # --- PROJECT AHAB: DATA PREP ---
-                book_data = {}
-                funding_rate = 0.0
-                if observer:
-                    try:
-                        book_data = observer.fetch_order_book(symbol)
-                        funding_rate = observer.fetch_funding_rate(symbol)
-                    except: pass
-                # -------------------------------
-                
-                entry_sig = oracle.analyze_for_entry(
-                    symbol, data, bb_vals, obv_slope, metabolism, 
-                    structure_ctx=structure_ctx,
-                    book_data=book_data,
-                    funding_rate=funding_rate
-                )
+            
+            # --- PROJECT AHAB: DATA PREP ---
+            book_data = {}
+            funding_rate = 0.0
+            if observer:
+                try:
+                    book_data = observer.fetch_order_book(symbol)
+                    funding_rate = observer.fetch_funding_rate(symbol)
+                except: pass
+            
+            # --- INTEGRATION: WHALE HOLON ---
+            whale = self.sub_holons.get('whale')
+            is_whale_signal = False
+            if whale:
+                # Calculate Daily Volume (Approx) for Dynamic Thresholds
+                # We have 100 candles of 15m (~25h). Sum(Close * Volume) for last 96 is strict 24h.
+                daily_vol_usd = 0.0
+                try:
+                    recent = data.iloc[-96:] if len(data) >= 96 else data
+                    daily_vol_usd = (recent['close'] * recent['volume']).sum()
+                except: 
+                    daily_vol_usd = 0.0
+
+                # Check for "Whale-Scalper" Setup (Bid Wall)
+                is_whale_signal = whale.check_bid_wall(symbol, book_data, daily_vol=daily_vol_usd)
+                if is_whale_signal:
+                    print(f"[{self.name}] 🐋 WHALE SIGNAL DETECTED: {symbol} (Bid Wall)")
+            # --------------------------------
+            
+            # --- UPDATE INTERVAL DYNAMICALLY ---
+            # Check Regime for VOL_WINDOW speed
+            if regime == 'VOL_WINDOW':
+                 self._active_interval = config.VOL_WINDOW_CYCLE_INTERVAL # 15s
+            else:
+                 self._active_interval = config.DEFAULT_CYCLE_INTERVAL if hasattr(config, 'DEFAULT_CYCLE_INTERVAL') else 60
+            # -----------------------------------
+
+            entry_sig = oracle.analyze_for_entry(
+                symbol, data, bb_vals, obv_slope, metabolism, 
+                structure_ctx=structure_ctx,
+                book_data=book_data,
+                ticker_data=getattr(self, 'session_ticker_data', {}).get(symbol, {}),
+                pack_stats=getattr(self, 'session_pack_stats', {}),
+                funding_rate=funding_rate,
+                observer=observer
+            )
+            
+            # Inject Whale Signal into Oracle Metadata if Oracle missed it or to reinforce
+            if entry_sig:
+                 if is_whale_signal:
+                     entry_sig.metadata['is_whale'] = True
+                     entry_sig.metadata['reason'] = 'WHALE_SCALPER'
+            elif is_whale_signal:
+                 # Force Entry if Whale Detected and Oracle didn't veto?
+                 pass
+
 
         guardian_exit = None
         entry_p = executor.entry_prices.get(symbol, 0.0) if executor else 0.0
@@ -702,10 +1061,17 @@ class TraderHolon(Holon):
         row_data['LSTM'] = f"{probes['lstm']:.2f}"
         row_data['XGB'] = f"{probes['xgb']:.2f}"
 
+        # 3D Holospace Data Injection
+        row_data['_entropy'] = entropy_val
+        row_data['_tda'] = tda_score
+        row_data['_price'] = current_price
+        row_data['_vol'] = atr if 'atr' in locals() else 0.0
+
         return {
             'symbol': symbol, 'data': data, 'price': current_price, 'row_data': row_data,
             'entropy_val': entropy_val, 'regime': regime, 'metabolism': metabolism,
             'entry_signal': entry_sig, 'guardian_exit': guardian_exit,
+            'tda_score': tda_score, 'tda_status': tda_status,
             'indicators': {'bb_vals': bb_vals, 'obv_slope': obv_slope, 'atr': atr, 'tr': tr}
         }
 
@@ -787,7 +1153,10 @@ class TraderHolon(Holon):
                 'gov_alloc': f"{config.GOVERNOR_MAX_MARGIN_PCT*100:.1f}%",
                 'gov_lev': f"{config.PREDATOR_LEVERAGE}x",
                 'gov_trends': str(len(gov.positions)) if gov else "0",
-                'gov_micro': f"{'ACTIVE' if config.MICRO_CAPITAL_MODE else 'OFF'}", # NEW: Wiring Fix
+                'gov_micro': f"{'ACTIVE' if config.MICRO_CAPITAL_MODE else 'OFF'}",
+                'risk_budget': f"${gov.risk_budget:.2f}" if gov else "$0.00",
+                'fortress_balance': f"${gov.fortress_balance:.2f}" if gov else "$300.00",
+                'solvency_status': 'SOLVENT' if (gov and gov.balance >= config.MIN_ORDER_VALUE) else 'INSOLVENT', # Explicit Warning
                 'regime': self.market_state['regime'],
                 'entropy': f"{self.market_state['entropy']:.4f}",
                 'strat_model': 'Warp-V4 (Hybrid)',
@@ -811,7 +1180,18 @@ class TraderHolon(Holon):
                 'entry_prices': {s: p['entry_price'] for s, p in (gov.positions.items() if gov else {})},
                 'current_prices': latest_prices,
                 'pending_count': len(executor.actuator.pending_orders) if executor and getattr(executor, 'actuator', None) else 0,
-                'news_feed': self.sub_holons['sentiment'].latest_news if 'sentiment' in self.sub_holons else []
+                'news_feed': self.sub_holons['sentiment'].latest_news if 'sentiment' in self.sub_holons else [],
+                # === Regime/Health Data ===
+                'health_score': self.sub_holons['regime'].get_status_summary().get('health_score', 0.0) if 'regime' in self.sub_holons else 0.0,
+                'promo_progress': self.sub_holons['regime'].get_status_summary().get('promotion_progress', 0.0) if 'regime' in self.sub_holons else 0.0,
+                # === Consolidation Radar ===
+                # === Consolidation Radar ===
+                'scout_data': [{'symbol': s, 'score': 0.95, 'reason': p} for s, p in self.scout_results.items()],
+                'consolidation_data': [
+                    {'symbol': r[0], 'score': float(r[1]), 'reason': r[2]} 
+                    for r in (oracle.get_consolidation_rankings()[:10] if oracle and hasattr(oracle, 'get_consolidation_rankings') else [])
+                    if isinstance(r, (list, tuple)) and len(r) >= 3
+                ]
             }
         })
 
@@ -855,9 +1235,19 @@ class TraderHolon(Holon):
             
             start = time.time()
             try: 
+                # --- CHECK FOR GENOME UPDATES (WINNING BRAIN) ---
+                self._scan_for_genome_updates()
+                # -----------------------------------------------
+
                 # Reduced Log Noise: Commented out cycle start print
                 # print(f"\n[{self.name}] --- Starting Warp Cycle (Interval: {interval_seconds}s) ---") 
                 
+                # --- PHASE X: TRAILING STOPS ---
+                # Manage stops before running new signals
+                ex = self.sub_holons.get('executor')
+                if ex: self._manage_trailing_stops(ex)
+                # -------------------------------
+
                 report = self.run_cycle()
                 
                 # GC Monitor: Run every N cycles
@@ -869,12 +1259,19 @@ class TraderHolon(Holon):
                 
                 if self.gui_queue: self.gui_queue.put({'type': 'summary', 'data': report})
                 
+                # --- PHASE 22: PPO REWARD HOSE ---
+                # Feed the Monolith with the results of this cycle (Action=Previous Conviction, Reward=Equity Delta)
+                self._feed_the_monolith(report)
+                # ---------------------------------
+                
                 # Disable Terminal Table Update
                 # layout = self._create_summary_layout(report)
                 # live.update(layout)
                 
             except Exception as e:
+                import traceback
                 print(f"[{self.name}] ☠️ Cycle Error: {e}")
+                traceback.print_exc()
                 time.sleep(30)
             
             wait = max(0, interval_seconds - (time.time() - start))
@@ -917,3 +1314,191 @@ class TraderHolon(Holon):
 
     def receive_message(self, sender, content): pass
     def _adapt_to_regime(self, regime): pass
+
+    def _feed_the_monolith(self, report):
+        """
+        Calculate Step Reward and feed the PPO Brain.
+        Reward = (Realized PnL + Unrealized Delta) / Volatility
+        """
+        governor = self.sub_holons.get('governor')
+        if not governor or not hasattr(governor, 'ppo'): return
+        
+        # 1. Calculate Reward
+        # We need equity change since last cycle.
+        current_equity = governor.balance
+        if not hasattr(self, 'last_ppo_equity'): self.last_ppo_equity = current_equity
+        
+        equity_delta = current_equity - self.last_ppo_equity
+        self.last_ppo_equity = current_equity
+        
+        # Normalize reward (e.g. $0.10 gain on $10 account = 1%)
+        # Scale up because PPO likes ~1.0 range
+        raw_reward = (equity_delta / config.INITIAL_CAPITAL) * 100.0
+        
+        # simple clipping to avoid exploding gradients from wild swings
+        reward = max(-5.0, min(5.0, raw_reward))
+        
+        # 2. Get State (Simplified for now)
+        # [WinRate, Drawdown, MarginUsed, ... ]
+        state = [
+            governor.db_manager.get_win_rate() if governor.db_manager else 0.5,
+            governor.drawdown_pct,
+            governor.margin_utilization,
+            0.0, 0.0, 0.0 # placeholders
+        ]
+        
+        # 3. Remember (We assume Action was 0.5 for now, finding exact action requires tracking)
+        # ideally we track what action PPO suggested at start of cycle.
+        # For now, we just train it to associate State -> Reward.
+        # This is a loose approximation to prime the memory.
+        import numpy as np
+        governor.ppo.remember(
+            state=np.array(state, dtype=np.float32), 
+            action=0.5, # Placeholder action
+            reward=reward, 
+            prob=0.5, 
+            val=0.5, 
+            done=False
+        )
+        
+        # 4. Learn periodically
+        if (self.cycle_counter % 10) == 0:
+            a_loss, c_loss = governor.ppo.learn()
+            if abs(a_loss) > 0:
+                print(f"[{self.name}] 🧠 PPO LEARN: Rewards={reward:.4f} | Loss A={a_loss:.4f} C={c_loss:.4f}")
+
+    def _scan_for_genome_updates(self):
+        """
+        Phase 46 + Ensemble: Checks for new Evolution Result & Hall of Fame.
+        Hot-swaps parameters and Ensemble Strategies.
+        """
+        import os
+        import json
+        
+        # 1. LIVE GENOME (Single Best) - Parameter Tuning
+        path_genome = os.path.join(os.getcwd(), 'live_genome.json')
+        if os.path.exists(path_genome):
+            try:
+                mtime = os.path.getmtime(path_genome)
+                if not hasattr(self, 'last_genome_mtime'): self.last_genome_mtime = 0
+
+                if mtime > self.last_genome_mtime:
+                    self.last_genome_mtime = mtime
+                    with open(path_genome, 'r') as f:
+                        data = json.load(f)
+                    
+                    genome = data.get('genome', {})
+                    if genome:
+                        print(f"[{self.name}] 🧬 DETECTED NEW EVOLVED BRAIN (Fitness: {data.get('fitness', 0):.2f})")
+                        
+                        # Update Config (Global Defaults)
+                        config.STRATEGY_RSI_OVERSOLD = float(genome.get('rsi_buy', config.STRATEGY_RSI_OVERSOLD))
+                        config.STRATEGY_RSI_OVERBOUGHT = float(genome.get('rsi_sell', config.STRATEGY_RSI_OVERBOUGHT))
+                        config.SATELLITE_STOP_LOSS = float(genome.get('stop_loss', config.SATELLITE_STOP_LOSS))
+                        config.SATELLITE_TAKE_PROFIT_1 = float(genome.get('take_profit', config.SATELLITE_TAKE_PROFIT_1))
+                        
+                        print(f"[{self.name}] ✅ Brain Transplant Successful. Parameters Active.")
+            except Exception as e:
+                print(f"[{self.name}] ⚠️ Genome Read Error: {e}")
+
+        # 2. HALL OF FAME (Ensemble) - Logic Update
+        path_hof = os.path.join(os.getcwd(), 'hall_of_fame.json')
+        if os.path.exists(path_hof):
+            try:
+                mtime = os.path.getmtime(path_hof)
+                if not hasattr(self, 'last_hof_mtime'): self.last_hof_mtime = 0
+                
+                if mtime > self.last_hof_mtime:
+                    self.last_hof_mtime = mtime
+                    
+                    oracle = self.sub_holons.get('oracle')
+                    if oracle and hasattr(oracle, 'load_ensemble'):
+                        oracle.load_ensemble(path_hof)
+                        print(f"[{self.name}] 🎭 ENSEMBLE DEPLOYED: Hall of Fame Loaded into Oracle.")
+            except Exception as e:
+                print(f"[{self.name}] ⚠️ HOF Read Error: {e}")
+
+    def _manage_trailing_stops(self, executor):
+        """
+        PHASE X: Active Trailing Stop Manager.
+        Scans open positions. If PnL > Activation Threshold (e.g. 1.5R),
+        Moves Stop Loss towards price to lock in gains.
+        """
+        if not executor or not executor.actuator: return
+        
+        # 1. Get Activation Parameters
+        # TODO: Pull from Live Genome?
+        # Default: Activate at 1.5% profit, Trail by 1.0% distance
+        activation_pct = 0.015 
+        trail_dist_pct = 0.010
+        
+        for symbol, qty in executor.held_assets.items():
+            if abs(qty) < 0.00000001: continue
+            
+            # Get Current Price
+            curr_price = executor.latest_prices.get(symbol, 0.0)
+            if curr_price <= 0: continue
+            
+            # Get Entry Data
+            meta = executor.position_metadata.get(symbol, {})
+            entry_price = meta.get('entry_price', curr_price)
+            if entry_price <= 0: continue
+            
+            direction = meta.get('direction', 'BUY')
+            
+            # Calculate PnL %
+            if direction == 'BUY':
+                pnl_pct = (curr_price - entry_price) / entry_price
+            else:
+                pnl_pct = (entry_price - curr_price) / entry_price
+                
+            # Check Activation
+            if pnl_pct > activation_pct:
+                # We are in profit zone!
+                
+                # Check Expected Stop Price
+                # Long: Price * (1 - trail)
+                # Short: Price * (1 + trail)
+                
+                if direction == 'BUY':
+                    new_stop_price = curr_price * (1.0 - trail_dist_pct)
+                else:
+                    new_stop_price = curr_price * (1.0 + trail_dist_pct)
+                    
+                # Find Existing Stop Order
+                # We look for pending stop orders for this symbol
+                existing_stop_id = None
+                existing_stop_price = 0.0
+                
+                for order in executor.actuator.pending_orders:
+                    if order.get('symbol') == symbol and order.get('type') == 'stop-market':
+                         existing_stop_id = order.get('id')
+                         existing_stop_price = float(order.get('stop_price', 0.0))
+                         break
+                         
+                # Decide Update
+                should_update = False
+                if existing_stop_id:
+                    if direction == 'BUY':
+                        # Move UP only
+                        if new_stop_price > (existing_stop_price * 1.001): # 0.1% buffer
+                            should_update = True
+                    else:
+                        # Move DOWN only
+                        if new_stop_price < (existing_stop_price * 0.999):
+                            should_update = True
+                else:
+                    # No stop? Create one!
+                    should_update = True
+                    
+                if should_update:
+                    print(f"[{self.name}] 🥅 TRAILING STOP UPDATE: {symbol} PnL {pnl_pct*100:.1f}%. Moving Stop -> {new_stop_price:.2f}")
+                    
+                    # Cancel Old
+                    if existing_stop_id:
+                        executor.actuator.cancel_order(existing_stop_id, symbol)
+                        
+                    # Place New
+                    # Stop Direction is Opposite to Position
+                    stop_dir = 'SELL' if direction == 'BUY' else 'BUY'
+                    executor.actuator.place_stop_order(symbol, stop_dir, abs(qty), new_stop_price)

@@ -26,8 +26,19 @@ class RegimeController:
         self.name = "RegimeController"
         
         # Current State
-        self.current_regime = 'MICRO'  # Always start conservative
-        self.previous_regime = 'MICRO'
+        # Current State
+        # PATCH: Auto-detect regime on startup based on Config Capital (Paper Trading Fix)
+        if config.INITIAL_CAPITAL >= 1000.0:
+            self.current_regime = 'MEDIUM'
+        elif config.INITIAL_CAPITAL >= 250.0:
+            self.current_regime = 'SMALL'
+        elif config.INITIAL_CAPITAL >= 50.0:
+            self.current_regime = 'MICRO'
+        else:
+            self.current_regime = 'NANO'
+            
+        print(f"[{self.name}] Initialized. Auto-Detected Regime: {self.current_regime} (Cap: ${config.INITIAL_CAPITAL})")
+        self.previous_regime = self.current_regime
         
         # Promotion Tracking
         self.equity_history: deque = deque(maxlen=1000)  # (timestamp, equity) tuples
@@ -113,11 +124,17 @@ class RegimeController:
         # B. Drawdown from Peak
         if self.peak_equity > 0:
             drawdown = (self.peak_equity - equity) / self.peak_equity
-            if drawdown >= config.REGIME_DEMOTION_DRAWDOWN_PCT:
+            
+            # Dynamic Threshold
+            limit = config.REGIME_DEMOTION_DRAWDOWN_PCT # Default 0.25
+            if self.current_regime == 'VOL_WINDOW':
+                limit = 0.12 # 12% Hard Stop for Vol Window
+            
+            if drawdown >= limit and self.current_regime != 'MICRO':
                 # Demote to MICRO regardless of current regime
-                if self.current_regime != 'MICRO':
-                    target_regime = 'MICRO'
-                    reason = f"Drawdown {drawdown*100:.1f}% >= {config.REGIME_DEMOTION_DRAWDOWN_PCT*100:.0f}%"
+                # If in VOL_WINDOW, we definitely go back to MICRO/NORMAL
+                target_regime = 'MICRO'
+                reason = f"Drawdown {drawdown*100:.1f}% >= {limit*100:.1f}%"
                     
         if target_regime:
             self._execute_transition(target_regime, reason, is_demotion=True)
@@ -178,6 +195,54 @@ class RegimeController:
             
         # All conditions met - PROMOTE
         self._execute_transition(target_regime, f"Equity ${equity:.2f} stable for {config.REGIME_PROMOTION_STABILITY_HOURS}h, Health {health_score:.2f}", is_demotion=False)
+
+    def check_vol_window_conditions(self, observer_data: Dict[str, float]) -> bool:
+        """
+        Check if we should enter the VOL_WINDOW High-Entropy Regime.
+        Requires:
+        1. BTC 24h Realized Vol > 45%
+        2. Avg Funding > 0.03% (Positive)
+        3. Spread < 0.4%
+        4. "Meme" Listing < 14 days (Optional check, assumed checked by caller or config)
+        """
+        btc_vol = observer_data.get('btc_vol', 0.0)
+        avg_funding = observer_data.get('avg_funding', 0.0) # 8h rate
+        avg_spread = observer_data.get('avg_spread', 0.0)
+        
+        # 1. Vol Check
+        if btc_vol < config.VOL_WINDOW_BTC_VOL_THRESHOLD:
+            return False
+            
+        # 2. Funding Check (Positive Bullish Sentiment)
+        if avg_funding < config.VOL_WINDOW_FUNDING_THRESHOLD:
+            return False
+            
+        # 3. Spread Check (Liquidity)
+        if avg_spread > config.VOL_WINDOW_SPREAD_THRESHOLD:
+            return False
+            
+        # All Clear
+        return True
+
+    def attempt_vol_window_entry(self, observer_data: Dict[str, float]):
+        """
+        Public method to trigger VOL_WINDOW entry if conditions met.
+        Overrules standard regimes.
+        """
+        if self.current_regime == 'VOL_WINDOW':
+            # Check exit conditions? (Reverse logic)
+            # If Vol drops OR Funding turns negative -> Exit
+            if not self.check_vol_window_conditions(observer_data):
+                print(f"[{self.name}] 📉 VOL_WINDOW Conditions Lost. Reverting to NORMAL.")
+                # Revert to appropriate capital regime
+                # For safety, go to MICRO first or calculate based on current equity
+                # We simply demote to MICRO to be safe, then let standard promotion take over.
+                self._execute_transition('MICRO', "VOL_WINDOW Conditions Lost", is_demotion=True)
+            return
+
+        # Check Entry
+        if self.check_vol_window_conditions(observer_data):
+            self._execute_transition('VOL_WINDOW', "High-Entropy Conditions Detected (Vol+Funding+Spread)", is_demotion=False)
         
     def _calculate_health_score(self) -> float:
         """
@@ -185,7 +250,7 @@ class RegimeController:
         Penalizes: Solvency rejections, GC corrections, HWM resets, high slippage.
         """
         if self.trade_count < config.REGIME_PROMOTION_MIN_TRADES:
-            return 0.0  # Not enough data
+            return 0.5  # Neutral Start (Fixes 'Coma' bug)
             
         # Start at 1.0, deduct for each issue
         score = 1.0
@@ -253,6 +318,18 @@ class RegimeController:
         """
         Return the permissions dict for the current regime.
         """
+        # Handle VOL_WINDOW specially if not in config dict yet (it should be)
+         # If not in config yet, return a hardcoded high-entropy set
+        if self.current_regime == 'VOL_WINDOW':
+            return {
+                'max_positions': config.VOL_WINDOW_MAX_POSITIONS,
+                'max_stacks': 0,
+                'max_exposure_ratio': config.VOL_WINDOW_LEVERAGE,
+                'max_leverage': config.VOL_WINDOW_LEVERAGE,
+                'allowed_pairs': config.ALLOWED_ASSETS, # All allowed
+                'correlation_check': False # Speed over safety
+            }
+            
         return config.REGIME_PERMISSIONS.get(self.current_regime, config.REGIME_PERMISSIONS['MICRO'])
         
     def is_transition_pending(self) -> bool:
@@ -270,3 +347,4 @@ class RegimeController:
             'transition_pending': self.transition_pending,
             'trade_count': self.trade_count,
         }
+

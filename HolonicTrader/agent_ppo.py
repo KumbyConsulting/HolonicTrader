@@ -40,7 +40,9 @@ class PPOHolon(Holon):
         self.clip_ratio = clip_ratio
         self.batch_size = batch_size
         
-        self.state_size = 6
+        # AEHML 2.0 State Vector (8): 
+        # [Regime_ID, Entropy, WinRate, ATR_Ratio, Drawdown, Margin, TDA_Score, RCMWPE_Regime]
+        self.state_size = 8 
         self.action_size = 1 # Continuous [0, 1]
         
         # Networks
@@ -110,7 +112,19 @@ class PPOHolon(Holon):
         PPO clipped policy update.
         """
         if len(self.states) < self.batch_size:
-            return
+            return 0.0, 0.0
+
+        # Safety Check: Buffer Consistency
+        # If the first item in buffer is wrong size, the whole buffer is likely suspect.
+        if len(self.states) > 0 and len(self.states[0]) != self.state_size:
+            print(f"[{self.name}] ⚠️ CRITICAL: Buffer Shape Mismatch during Learn (Expected {self.state_size}, Got {len(self.states[0])}). Purging Buffer.")
+            self.states = []
+            self.actions = []
+            self.rewards = []
+            self.old_probs = []
+            self.values = []
+            self.dones = []
+            return 0.0, 0.0
 
         states = np.array(self.states)
         actions = np.array(self.actions)
@@ -184,6 +198,11 @@ class PPOHolon(Holon):
         return float(a_loss), float(c_loss)
 
     def remember(self, state, action, reward, prob, val, done):
+        # Safety Check: Input Shape Protection
+        if state.shape[0] != self.state_size:
+            # print(f"[{self.name}] ⚠️ Discarding Mismatched Experience. Expected {self.state_size}, Got {state.shape[0]}.")
+            return
+            
         self.states.append(state)
         self.actions.append(action)
         self.rewards.append(reward)
@@ -221,8 +240,21 @@ class PPOHolon(Holon):
 
         if os.path.exists(path_actor) and os.path.exists(path_critic):
             try:
-                self.actor = models.load_model(path_actor, compile=False)
-                self.critic = models.load_model(path_critic, compile=False)
+                # Load candidates
+                loaded_actor = models.load_model(path_actor, compile=False)
+                loaded_critic = models.load_model(path_critic, compile=False)
+                
+                # Check Input Shape Compatibility (AEHML 2.0 Upgrade Protection)
+                if loaded_actor.input_shape[-1] != self.state_size:
+                    print(f"[{self.name}] ⚠️ Model Version Mismatch! (Expected {self.state_size}, Got {loaded_actor.input_shape[-1]}). Resetting Brain for AEHML 2.0.")
+                    # Rename old models to backup
+                    os.rename(path_actor, path_actor + ".legacy.bak")
+                    os.rename(path_critic, path_critic + ".legacy.bak")
+                    # Force fresh init
+                    raise ValueError("Version Mismatch")
+                
+                self.actor = loaded_actor
+                self.critic = loaded_critic
                 
                 # Re-compile manually to fix serialization issues (e.g. mse)
                 self.actor.compile(optimizer=optimizers.Adam(learning_rate=self.lr))

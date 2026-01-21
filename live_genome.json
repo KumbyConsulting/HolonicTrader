@@ -1,0 +1,28 @@
+{
+    "genome": {
+        "rsi_buy": 48.97886647056953,
+        "rsi_sell": 80.02634299904018,
+        "stop_loss": 0.026562892046279825,
+        "take_profit": 0.08242578644375519,
+        "use_satellite": true,
+        "sat_rvol": 4.3846268379994395,
+        "sat_bb_expand": 0.2195195095095845,
+        "leverage_cap": 1.0,
+        "trailing_activation": 1.5237518429939065,
+        "trailing_distance": 0.24471680403995374
+    },
+    "final_equity": 2622473.3487968165,
+    "roi": 8740.577829322721,
+    "win_rate": 0.27450980392156865,
+    "trades": 51,
+    "max_dd": 0.1492700784991033,
+    "sharpe": 0.008978108300996159,
+    "sortino": 0.012798794392269875,
+    "validation_roi": -0.006586472675443928,
+    "validation_trades": 1,
+    "entropy": 0.0,
+    "test_score": 0.1,
+    "fitness": 3.6164227173686125,
+    "timestamp": 1768985971.8261714,
+    "source_island": "\ud83c\udff0 Iron Fort"
+}
