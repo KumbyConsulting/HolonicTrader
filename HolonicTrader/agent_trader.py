@@ -22,6 +22,7 @@ from HolonicTrader.agent_executor import TradeSignal, TradeDecision
 from performance_tracker import get_performance_data
 import config
 from HolonicTrader.agent_trinity import TrinityStrategy # NEW: Phase 46
+from core.scouts.entropy_scouter import EntropyScouter # AEHML Upgrade
 
 class TraderHolon(Holon):
     """
@@ -38,10 +39,18 @@ class TraderHolon(Holon):
         self.gui_stop_event = None
         self.last_ppo_conviction = 0.5
         
+        # Cycle Counters
+        self.cycle_counter = 0
+        self.scout_last_run = 0
+        self.last_ppo_reward = 0.0  # PPO reward tracking
+        self.gc_cycle_counter = 0   # Garbage collection counter
+        
         # Scout State
-        self.scout_last_run = 0.0
-        self.scout_results = {} # Cache for scout findings
-        self.scout_active_list = [] # Persistent Scout Findings
+        self.scout_results = {}  # Cache for scout findings
+        self.scout_active_list = []  # Persistent scout findings
+        
+        # 3D Holospace Memory (NEW - Phase 46)
+        self.market_phase_data = {}  # symbol -> [{'entropy': ..., 'tda': ..., 'price': ...}]
         self.active_session_whitelist = config.ACTIVE_WATCHLIST.copy() # Start with Hot List
         self._load_whitelist_from_disk()
         
@@ -52,6 +61,9 @@ class TraderHolon(Holon):
         
         # Phase 46: Trinity Strategy
         self.trinity = TrinityStrategy()
+        
+        # AEHML: Entropy Scouter
+        self.entropy_scouter = EntropyScouter()
 
         self.cycle_counter = 0 # General cycle counter (Phase 46 Fix)
 
@@ -118,47 +130,131 @@ class TraderHolon(Holon):
 
     def _run_scout_cycle(self):
         """
-        The Slow Loop: Scans the Cold List for opportunities to promote.
+        The Slow Loop: Scans the Cold List -> Entropy Filter -> Whitelist.
+        AEHML Upgrade: Physics-based asset selection.
         """
         if time.time() - self.scout_last_run < config.SCOUT_CYCLE_INTERVAL:
             return
 
         observer = self.sub_holons.get('observer')
-        oracle = self.sub_holons.get('oracle')
-        if not observer or not oracle: return
+        if not observer: return
 
-        print(f"[{self.name}] 🔭 SCOUT CYCLE STARTING... Scanning {len(config.SCOUT_CANDIDATES)} candidates.")
+        print_verbose = getattr(self, 'verbose_logging', False)
+        if print_verbose:
+            print(f"[{self.name}] 🔭 SCOUT CYCLE STARTING... (Physics Mode)")
         
-        # 1. Efficient Batch Fetch (1 API Call)
-        tickers = observer.fetch_tickers_batch(config.SCOUT_CANDIDATES)
-        
-        promoted_count = 0
-        scout_results = {}
-        
-        for symbol, ticker_data in tickers.items():
-            # 2. Profile
-            personality = oracle.profile_asset_class(symbol, ticker_data)
-            scout_results[symbol] = personality
+        try:
+            # 1. Gather Candidates (Trinity + Config + Current)
+            scan_list = set(config.SCOUT_CANDIDATES)
+            if hasattr(self, 'trinity'):
+                scan_list.update(self.trinity.get_watch_list())
+            scan_list.update(self.active_session_whitelist)
             
-            if symbol in self.scout_active_list: continue # Already active
+            # Limit to prevent timeouts (max 15 assets per cycle)
+            if len(scan_list) > 15:
+                # --- PROFIT BOOST: PRIORITY SCOUTING ---
+                # Fetch 24h stats for all candidates and sort by Quote Volume
+                try:
+                    tickers = observer.fetch_tickers_batch(list(scan_list))
+                    if tickers:
+                        # Sort by quoteVolume (descending)
+                        def get_vol(sym):
+                            # Try direct key (KuCoin style)
+                            t = tickers.get(sym)
+                            if not t:
+                                # Try mapped key (Kraken style)
+                                mapped = config.KRAKEN_SYMBOL_MAP.get(sym)
+                                if mapped: t = tickers.get(mapped)
+                            return float(t.get('quoteVolume') or 0.0) if t else 0.0
+
+                        sorted_candidates = sorted(
+                            list(scan_list),
+                            key=get_vol,
+                            reverse=True
+                        )
+                        scan_list = sorted_candidates[:15]
+                        if print_verbose:
+                            print(f"[{self.name}] 🔭 Priority Scouting: Kept top 15 assets by Volume.")
+                    else:
+                        scan_list = list(scan_list)[:15]
+                except Exception as e:
+                    print(f"[{self.name}] ⚠️ Scout Sort Error: {e}")
+                    scan_list = list(scan_list)[:15]
+                
+                if print_verbose:
+                    print(f"[{self.name}] ⚠️ Scout list capped at 15 assets.")
             
-            if personality in ['ROCKET', 'ANCHOR']:
-                print(f"[{self.name}] 🚀 SCOUT PROMOTION: {symbol} identified as {personality}. Adding to Active Loop.")
-                self.scout_active_list.append(symbol)
-                promoted_count += 1
-        
-        # Sync Status for GUI
-        self._sync_scout_status_to_disk(scout_results)
-        
-        if promoted_count > 0:
+            # 2. Fetch Data (Reduced to 50 candles for faster fetch)
+            # Using 1h data for stable regime detection
+            start_fetch = time.time()
+            tickers_data = observer.fetch_market_data_batch(list(scan_list), timeframe='1h', limit=50)
+            fetch_duration = time.time() - start_fetch
+            
+            if fetch_duration > 10.0:
+                print(f"[{self.name}] ⚠️ Scout fetch took {fetch_duration:.1f}s (slow network)")
+            
+            # Early exit if no data
+            if not tickers_data or len(tickers_data) == 0:
+                print(f"[{self.name}] ⚠️ Scout fetch returned no data. Skipping cycle.")
+                self.scout_last_run = time.time()
+                return
+            
+            # 3. Entropy Scout Analysis
+            scout_results = self.entropy_scouter.scout_regimes(tickers_data)
+            self.scout_results = scout_results # Update generic cache
+            
+            # 4. Filter Whitelist
+            # We only trade ORDERED or TRANSITION markets. CHAOS is vetoed (unless specialized).
+            # We also keep manually held assets to allow safe exits.
+            
+            held_assets = []
+            executor = self.sub_holons.get('executor')
+            if executor: held_assets = list(executor.held_assets.keys())
+            
+            approved_list = []
+            promoted_count = 0
+            
+            for sym in scan_list:
+                # Always keep what we hold
+                if sym in held_assets:
+                    approved_list.append(sym)
+                    continue
+                    
+                res = scout_results.get(sym, {})
+                regime = res.get('regime', 'UNKNOWN')
+                entropy = res.get('entropy', 0.0)
+                
+                if regime in ['ORDERED', 'TRANSITION']:
+                    approved_list.append(sym)
+                    
+                    # Promotion Log
+                    if sym not in self.active_session_whitelist:
+                        print(f"[{self.name}] 🚀 SCOUT PROMOTION: {sym} (Regime: {regime}, Ent: {entropy:.2f})")
+                        promoted_count += 1
+                else:
+                    # CHAOTIC -> Reject
+                    if sym in self.active_session_whitelist and sym not in held_assets:
+                        print(f"[{self.name}] 📉 SCOUT DEMOTION: {sym} entered CHAOS (Ent: {entropy:.2f}). Dropping.")
+            
+            # 5. Commit
+            # 5. Commit (Fixed: Persist to scout_active_list)
+            self.scout_active_list = list(set(approved_list)) 
+            self.active_session_whitelist = self.scout_active_list.copy()
             self._sync_whitelist_to_disk()
+            self._sync_scout_status_to_disk(scout_results)
             
-        self.scout_last_run = time.time()
-        self.last_ppo_reward = 0.0
-        self.scout_last_run = time.time()
-        self.last_ppo_reward = 0.0
-        self.gc_cycle_counter = 0  # GC Monitor cycle counter
-        self.cycle_counter = 0 # General cycle counter (Phase 46 Fix)
+            # --- PHASE 46.2: WS SYNC ---
+            if observer:
+                observer.update_ws_symbols(self.active_session_whitelist)
+            # ---------------------------
+                
+            self.scout_last_run = time.time()
+            
+        except Exception as e:
+            print(f"[{self.name}] ❌ SCOUT CYCLE ERROR: {e}")
+            # Update timestamp to prevent immediate retry
+            self.scout_last_run = time.time()
+
 
     def register_agent(self, role: str, agent: Holon):
         self.sub_holons[role] = agent
@@ -200,7 +296,7 @@ class TraderHolon(Holon):
                  if governor:
                      governor.set_live_balance(current_equity, free_margin)
                  if executor:
-                     executor.sync_balance(current_equity) # Updates DB and Internal
+                     executor.sync_balance(free_margin) # Updates DB and Internal
                      
                  # Also update Monitor if present
                  if monitor:
@@ -215,6 +311,7 @@ class TraderHolon(Holon):
                  # But if Actuator is down, we can't do anything.
                  if getattr(executor.actuator, 'circuit_open', False):
                      print(f"[{self.name}] 💤 API CIRCUIT OPEN. Skipping Cycle.")
+                     self.publish_agent_status()
                      time.sleep(10) 
                      return []
         
@@ -224,6 +321,7 @@ class TraderHolon(Holon):
             if not is_healthy:
                 print(f"[{self.name}] 🛑 CRITICAL HEALTH LOCKDOWN: {risk_msg}")
                 print(f"[{self.name}] 💤 HIBERNATING for 4 hours to cool down...")
+                self.publish_agent_status()
                 time.sleep(14400) # 4 Hour Hard Sleep
                 return [] # Skip cycle
         
@@ -232,6 +330,7 @@ class TraderHolon(Holon):
              is_healthy_old, _ = monitor.check_vital_signs()
              if not is_healthy_old:
                  print(f"[{self.name}] 🛑 HEALTH LOCKDOWN (Persistent State). Skipping.")
+                 self.publish_agent_status()
                  return []
         # -------------------------------------------------------------
         
@@ -241,6 +340,7 @@ class TraderHolon(Holon):
         cycle_report = []
         entropies = []
         cycle_data_cache = {}
+        print_verbose = getattr(self, 'verbose_logging', False)
 
         oracle = self.sub_holons.get('oracle')
         observer = self.sub_holons.get('observer')
@@ -252,6 +352,7 @@ class TraderHolon(Holon):
         sentiment = self.sub_holons.get('sentiment')
         overwatch = self.sub_holons.get('overwatch') 
         regime_controller = self.sub_holons.get('regime')
+        arbitrage = self.sub_holons.get('arbitrage')
 
         # --- PHASE -2: REGIME STATE UPDATE ---
         if regime_controller and executor:
@@ -268,9 +369,24 @@ class TraderHolon(Holon):
             regime_status = regime_controller.get_status_summary()
             print(f"[{self.name}] 📊 Regime: {regime_status['regime']} | Health: {regime_status['health_score']:.2f} | Peak: ${regime_status['peak_equity']:.2f}")
 
+            # NEW: Emit Structured Event for Dashboard
+            if self.gui_queue:
+                self.gui_queue.put({
+                    'type': 'regime_status',
+                    'data': {
+                        'regime': regime_status['regime'],
+                        'health': regime_status['health_score'],
+                        'peak': regime_status['peak_equity']
+                    }
+                })
+
         # --- PHASE -1: OVERWATCH AUDIT (The Sentry) ---
         if overwatch:
             overwatch.perform_audit()
+            
+        # --- PHASE -0.5: ARBITRAGE SYNC ---
+        if arbitrage:
+            arbitrage.perform_sync(self.active_session_whitelist)
             
         # Evolution Watcher
         self._scan_for_genome_updates()
@@ -316,19 +432,21 @@ class TraderHolon(Holon):
             target_list = list(trinity_targets.keys()) + open_positions + self.scout_active_list
             self.active_session_whitelist = list(set(target_list))
             
-            print(f"[{self.name}] 🧘 Trinity Rotation: {m_regime} | {btc_trend} -> Focus: {list(trinity_targets.keys())} (+{len(self.scout_active_list)} Scout Items)")
-            
-            # OPTIMIZATION: Parallel Batch Fetch via Observer
+            # --- PHASE 46.1: UNIFIED MATRIX FETCH (Warp Speed) ---
             target_assets = self.active_session_whitelist
-            batch_data = observer.fetch_market_data_batch(target_assets, limit=100)
+            if print_verbose:
+                print(f"[{self.name}] ⚡ Matrix Syncing {len(target_assets)} assets...")
             
-            for sym, data in batch_data.items():
-                cycle_data_cache[sym] = data
-                # Warmup Oracle (Kalman) - Fast compute, can run sequentially or parallel if needed
-                # For 10-20 assets, sequential compute is negligible compared to IO
+            # Unified parallel fetch (15m, 1h, Books, Funding)
+            cycle_data_cache = observer.fetch_matrix_data(target_assets)
+            
+            # Warm up Oracle (Kalman) with synced data
+            for sym, data in cycle_data_cache.items():
                 try:
-                    oracle.get_kalman_estimate(sym, data)
+                    oracle.get_kalman_estimate(sym, data['df_15m'])
                 except: pass
+            
+            # -----------------------------------------------------
             
 
             
@@ -337,8 +455,9 @@ class TraderHolon(Holon):
             pack_changes = []
             self.session_ticker_data = {} # Store for _analyze_asset lookup
             
-            for sym, d in batch_data.items():
-                if len(d) >= 90: # Need approx 24h data (96 bars of 15m)
+            for sym, unit in cycle_data_cache.items():
+                d = unit.get('df_15m')
+                if d is not None and len(d) >= 90: # Need approx 24h data (96 bars of 15m)
                     try:
                         # Use first available bar if < 96, else -96
                         start_idx = -96 if len(d) >= 96 else 0
@@ -361,14 +480,41 @@ class TraderHolon(Holon):
                 self.session_pack_stats = {'mean': 0.0, 'std': 1.0}
             # ---------------------------
 
-            # Pass Sentiment Score to Oracle
-            global_bias = oracle.get_market_bias(sentiment_score=sent_score)
-            print(f"[{self.name}] 📊 GLOBAL BIAS: {global_bias:.2f} (Sentiment: {sent_score:+.2f})")
+            # --- PHASE 46.3: RUST BATCH ANALYSIS (Tier 3) ---
+            if print_verbose:
+                print(f"[{self.name}] 🦀 Rust-Accelerating Signals...")
+                
+            batch_prices = {s: d['df_15m']['close'].values.tolist() for s, d in cycle_data_cache.items() if d.get('df_15m') is not None}
+            batch_highs = {s: d['df_15m']['high'].values.tolist() for s, d in cycle_data_cache.items() if d.get('df_15m') is not None}
+            batch_lows = {s: d['df_15m']['low'].values.tolist() for s, d in cycle_data_cache.items() if d.get('df_15m') is not None}
+            
+            import holonic_speed
+            rust_signals = holonic_speed.calculate_signals_matrix(
+                list(batch_prices.keys()),
+                batch_prices,
+                batch_highs,
+                batch_lows
+            )
+            
+            # Pack rust signals into cache for propagation
+            for s, signals in rust_signals.items():
+                if s in cycle_data_cache:
+                    cycle_data_cache[s]['rust_signals'] = signals
+            # -----------------------------------------------
 
-        # --- PHASE 1: PARALLEL ANALYSIS PASS ---
+            # --- PHASE 1: PARALLEL ANALYSIS PASS ---
         analysis_results = []
         with ThreadPoolExecutor(max_workers=config.TRADER_MAX_WORKERS) as t_pool:
-            futures = [t_pool.submit(self._analyze_asset, s, cycle_data_cache.get(s)) for s in self.active_session_whitelist]
+            futures = []
+            for s in self.active_session_whitelist:
+                cache = cycle_data_cache.get(s, {})
+                df_15m = cache.get('df_15m')
+                df_1h = cache.get('df_1h')
+                book = cache.get('book')
+                funding = cache.get('funding')
+                rust_sigs = cache.get('rust_signals')
+                futures.append(t_pool.submit(self._analyze_asset, s, df_15m, df_1h, global_bias, book, funding, rust_sigs))
+            
             try:
                 for f in as_completed(futures, timeout=30):
                     try:
@@ -498,8 +644,13 @@ class TraderHolon(Holon):
                 
                 if entry_sig and executor and governor and oracle:
                     pnl_tracker = get_performance_data()
-                    atr_ref = indicators['tr'].rolling(14).mean().rolling(14).mean().iloc[-1]
-                    atr_ratio = min(2.0, indicators['atr'] / atr_ref) if atr_ref > 0 else 1.0
+                    tr_series = indicators.get('tr')
+                    if tr_series is not None and not tr_series.empty:
+                        atr_ref = tr_series.rolling(14).mean().rolling(14).mean().iloc[-1]
+                    else:
+                        atr_ref = indicators.get('atr', 1.0) # Fallback to current ATR or unit
+                    
+                    atr_ratio = min(2.0, indicators.get('atr', 0.0) / atr_ref) if atr_ref > 0 else 1.0
                     gov_health = governor.get_portfolio_health()
                     
                     # AEHML 2.0: PPO State Expansion (Now 8-Dim)
@@ -525,7 +676,11 @@ class TraderHolon(Holon):
 
                     conviction = ppo.get_conviction(ppo_state) if ppo else 0.5
                     self.last_ppo_conviction = conviction
-                    entry_sig.metadata = {'ppo_state': ppo_state.tolist(), 'ppo_conviction': conviction, 'atr': indicators['atr']}
+                    entry_sig.metadata.update({
+                        'ppo_state': ppo_state.tolist(), 
+                        'ppo_conviction': conviction, 
+                        'atr': indicators['atr']
+                    })
 
                     # --- NOISE REDUCTION: Signal Deduplication ---
                     # Prevent spamming "EXECUTING ENTRY" or "GOVERNOR VETO" for the same signal 15x times
@@ -576,7 +731,8 @@ class TraderHolon(Holon):
                         approved, safe_qty, leverage = governor.calc_position_size(
                             symbol, current_price, indicators['atr'], atr_ref, conviction, 
                             direction=entry_sig.direction, sentiment_score=sent_score,
-                            whale_confirmed=is_whale
+                            whale_confirmed=is_whale, market_bias=global_bias,
+                            metadata=entry_sig.metadata
                         )
                     else:
                         approved = False
@@ -673,7 +829,7 @@ class TraderHolon(Holon):
                     print(f"[{self.name}] 🚫 THESIS INVALIDATED for {symbol}. Exiting.")
                     # FIX: Dynamic Exit Direction
                     exit_dir = 'BUY' if direction == 'SELL' else 'SELL'
-                    thesis_exit = TradeSignal(symbol, exit_dir, 1.0, current_price)
+                    thesis_exit = TradeSignal(symbol, exit_dir, 1.0, current_price, metadata={'reason': 'Thesis'})
                 # -----------------------------------------------------
 
                 # hard_exit_type removed (Redundant)
@@ -841,9 +997,10 @@ class TraderHolon(Holon):
         self.publish_agent_status()
         return cycle_report
 
-    def _analyze_asset(self, symbol: str, data: Optional[pd.DataFrame]) -> Optional[Dict[str, Any]]:
+    def _analyze_asset(self, symbol, data, df_1h, global_bias, book_data, funding_rate, rust_sigs=None):
         observer = self.sub_holons.get('observer')
         if data is None and observer:
+             # Fallback for manual/single calls (not in batch cycle)
             try: data = observer.fetch_market_data(limit=100, symbol=symbol)
             except: return None
         if data is None: return None
@@ -854,8 +1011,41 @@ class TraderHolon(Holon):
              print(f"[{self.name}] ⚠️ Data Validation Error for {symbol}. Missing Columns. Keys: {data.columns.tolist()}")
              return None
 
-        row_data = {'Symbol': symbol, 'Price': f"{data['close'].iloc[-1]:.4f}", 'Regime': '?', 'Action': 'HOLD', 'PnL': '-', 'Note': ''}
+        # Dashboard Layout Alignment
+        price_str = f"{data['close'].iloc[-1]:.4f}"
+        if data['close'].iloc[-1] < 0.01:
+             price_str = f"{data['close'].iloc[-1]:.8f}"
+            
+        row_data = {
+            'Symbol': symbol, 
+            'Price': price_str, 
+            'Regime': '?', 
+            'Struct': '-',
+            'Entropy': '0.000',
+            'RSI': '-',
+            'LSTM': '0.50',
+            'XGB': '0.50',
+            'PnL': '-', 
+            'Action': 'HOLD', 
+            'Note': ''
+        }
+        indicators = {}
+        
+        # Calculate TR (Always available as Series for downstream RL logic)
+        tr = pd.concat([(data['high']-data['low']), (data['high']-data['close'].shift()).abs(), (data['low']-data['close'].shift()).abs()], axis=1).max(axis=1)
+        
         current_price = data['close'].iloc[-1]
+        atr = 0.0 
+        entropy_val = 0.0
+        regime = 'TRANSITION'
+        tda_score = 0.5
+        tda_status = 'STABLE'
+        obv_slope = 0.0
+        bb_vals = {'upper': current_price, 'middle': current_price, 'lower': current_price}
+        
+        if current_price <= 0:
+             print(f"[{self.name}] ⚠️ Price Data Invalid for {symbol}: {current_price}. Skipping.")
+             return None
         
         # PROFILING LOG (User Request)
         if symbol in ['SOL/USDT', 'XRP/USDT', 'BTC/USDT', 'XTZ/USDT', 'TBTC/USDT']:
@@ -872,12 +1062,15 @@ class TraderHolon(Holon):
         
         # 2. Get 1h Trend (Macro)
         macro_trend = 'NEUTRAL'
-        if observer:
+        if df_1h is not None and not df_1h.empty:
+            # User Request: Stable Trend Filter using 20 EMA
+            ema_trend = df_1h['close'].ewm(span=20, adjust=False).mean().iloc[-1]
+            macro_trend = 'BULLISH' if df_1h['close'].iloc[-1] > ema_trend else 'BEARISH'
+        elif observer:
+            # Fallback (Slow)
             try:
-                # Assuming observer has cached 1h data or fetches it fast
                 df_1h = observer.fetch_market_data(timeframe='1h', limit=50, symbol=symbol)
                 if not df_1h.empty:
-                    # User Request: Stable Trend Filter using 20 EMA
                     ema_trend = df_1h['close'].ewm(span=20, adjust=False).mean().iloc[-1]
                     macro_trend = 'BULLISH' if df_1h['close'].iloc[-1] > ema_trend else 'BEARISH'
             except: pass
@@ -895,31 +1088,29 @@ class TraderHolon(Holon):
         executor = self.sub_holons.get('executor')
         topology = self.sub_holons.get('topology') # <--- AEHML 2.0
         
-        # 3. Calculate Entropy & Regime
-        entropy_val = 0.0
-        regime = 'TRANSITION'
-        tda_score = 0.5
-        tda_status = 'STABLE'
-
-        if entropy_agent:
-            # Note: Using calculated returns from indicators usually, but here calculating fresh?
-            # Let's assume data['close'] is Series.
-            # Efficiency: Calculate returns once
+        if rust_sigs:
+            entropy_val = rust_sigs.get('shannon_entropy', 0.0)
+            regime = entropy_agent.determine_regime(entropy_val) if entropy_agent else 'UNKNOWN'
+            row_data['Entropy'], row_data['Regime'] = f"{entropy_val:.3f}", regime
+            structure_ctx['entropy_val'] = entropy_val
+            structure_ctx['entropy_regime'] = regime
+        elif entropy_agent:
+            # Fallback
             returns = data['close'].pct_change().dropna()
             entropy_val = entropy_agent.calculate_shannon_entropy(returns)
             regime = entropy_agent.determine_regime(entropy_val)
             row_data['Entropy'], row_data['Regime'] = f"{entropy_val:.3f}", regime
-            
-            # --- INTEGRATION: Pass Entropy to Oracle via Context ---
             structure_ctx['entropy_val'] = entropy_val
             structure_ctx['entropy_regime'] = regime
-            # -----------------------------------------------------
 
         # AEHML 2.0: Topological Check
         if topology:
             tda_res = topology.analyze_structure(data)
             tda_score = tda_res.get('score', 0.5)
             tda_status = tda_res.get('status', 'STABLE')
+            
+            # Wire to Dashboard
+            row_data['Struct'] = f"{tda_status} ({tda_score:.2f})"
             
             # If topology is collapsing, override regime display to warn user
             if tda_status == 'CRITICAL':
@@ -938,39 +1129,52 @@ class TraderHolon(Holon):
              structure_ctx.update(base_ctx)
 
         # Indicators (RUST ACCELERATED)
-        # Common Indicators (calculated globally to fix UnboundLocalError)
-        tr = pd.concat([(data['high']-data['low']), (data['high']-data['close'].shift()).abs(), (data['low']-data['close'].shift()).abs()], axis=1).max(axis=1)
-
-        try:
-            import holonic_speed
-            
-            closes_list = data['close'].values.tolist()
-            highs_list = data['high'].values.tolist()
-            lows_list = data['low'].values.tolist()
-            
-            rsi_series = holonic_speed.calculate_rsi(closes_list, 14)
-            data['rsi'] = rsi_series[-len(data):]
-            rsi_val = rsi_series[-1]
-            
-            bb_u, bb_m, bb_l = holonic_speed.calculate_bollinger_bands(closes_list, 20, 2.0)
-            bb_vals = {'upper': bb_u[-1], 'middle': bb_m[-1], 'lower': bb_l[-1]}
-            
-            atr_series = holonic_speed.calculate_atr(highs_list, lows_list, closes_list, 14)
-            atr = atr_series[-1]
-            
+        if rust_sigs:
+            rsi_val = rust_sigs.get('rsi', 50.0)
+            atr = rust_sigs.get('atr', 0.0)
+            bb_vals = {
+                'upper': rust_sigs.get('bb_upper', current_price),
+                'middle': current_price, # Middle not explicitly in my rust batch but can be added or ignored
+                'lower': rust_sigs.get('bb_lower', current_price)
+            }
             row_data['RSI'] = f"{rsi_val:.1f}"
+            indicators['rsi'] = rsi_val
+            indicators['atr'] = atr
+            indicators['bb'] = bb_vals
+            # Add SDE Params for Physics Oracle
+            for k, v in rust_sigs.items():
+                if k.startswith('ou_'):
+                    indicators[k] = v
+        else:
+            # LEGACY FALLBACK (Pandas)
+            # tr already calculated above
 
-        except ImportError:
-            # Fallback to Pandas (Legacy)
             delta = data['close'].diff()
             gain = (delta.where(delta > 0, 0)).rolling(14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-            row_data['RSI'] = f"{(100 - (100 / (1 + (gain / loss))).iloc[-1]):.1f}"
+            
+            # Divide by zero safety
+            with np.errstate(divide='ignore', invalid='ignore'):
+                rs = gain / loss
+                rsi_val = 100 - (100 / (1 + rs)).iloc[-1]
+            
+            row_data['RSI'] = f"{rsi_val:.1f}"
+            indicators['rsi'] = rsi_val
 
             rolling_mean, rolling_std = data['close'].rolling(20).mean(), data['close'].rolling(20).std()
-            bb_vals = {'upper': (rolling_mean + 2*rolling_std).iloc[-1], 'middle': rolling_mean.iloc[-1], 'lower': (rolling_mean - 2*rolling_std).iloc[-1]}
+            bb_vals = {
+                'upper': (rolling_mean + 2*rolling_std).iloc[-1], 
+                'middle': rolling_mean.iloc[-1], 
+                'lower': (rolling_mean - 2*rolling_std).iloc[-1]
+            }
+            indicators['bb'] = bb_vals
             
-            atr = tr.rolling(14).mean().iloc[-1]
+            # Correctly handle ATR in fallback
+            if tr is not None:
+                atr = tr.rolling(14).mean().iloc[-1]
+            else:
+                atr = 0.0
+            indicators['atr'] = atr
         
         obv = (np.sign(data['close'].diff()).fillna(0) * data['volume']).cumsum()
         obv_slope, _, _, _, _ = linregress(np.arange(14), obv.iloc[-14:].values)
@@ -988,13 +1192,14 @@ class TraderHolon(Holon):
             last_exit = guardian.last_exit_times.get(symbol) if guardian else None
             
             # --- PROJECT AHAB: DATA PREP ---
-            book_data = {}
-            funding_rate = 0.0
-            if observer:
-                try:
-                    book_data = observer.fetch_order_book(symbol)
-                    funding_rate = observer.fetch_funding_rate(symbol)
-                except: pass
+            # Using pre-fetched batch data
+            if book_data is None and observer:
+                try: book_data = observer.fetch_order_book(symbol)
+                except: book_data = {}
+            
+            if funding_rate == 0.0 and observer:
+                try: funding_rate = observer.fetch_funding_rate(symbol)
+                except: funding_rate = 0.0
             
             # --- INTEGRATION: WHALE HOLON ---
             whale = self.sub_holons.get('whale')
@@ -1023,15 +1228,30 @@ class TraderHolon(Holon):
                  self._active_interval = config.DEFAULT_CYCLE_INTERVAL if hasattr(config, 'DEFAULT_CYCLE_INTERVAL') else 60
             # -----------------------------------
 
-            entry_sig = oracle.analyze_for_entry(
-                symbol, data, bb_vals, obv_slope, metabolism, 
-                structure_ctx=structure_ctx,
-                book_data=book_data,
-                ticker_data=getattr(self, 'session_ticker_data', {}).get(symbol, {}),
-                pack_stats=getattr(self, 'session_pack_stats', {}),
-                funding_rate=funding_rate,
-                observer=observer
-            )
+            # --- INTEGRATION: ARBITRAGE HUNTER (PHASE 46.5) ---
+            # Check for Gold Nuggets (Basis Yield or Spatial Arb) before technicals
+            arb_signal = getattr(self.sub_holons.get('arbitrage'), 'get_active_signal', lambda x, y: None)(symbol, current_price)
+            if arb_signal:
+                print(f"[{self.name}] 💰 ARB HUNTER STRIKE: {symbol} -> {arb_signal['direction']} ({arb_signal['reason']})")
+                # Force Entry Signal
+                entry_sig = TradeSignal(
+                    symbol=symbol,
+                    direction=arb_signal['direction'],
+                    size=1.0, 
+                    price=current_price,
+                    conviction=arb_signal['confidence'],
+                    metadata={'reason': arb_signal['reason'], 'is_whale': True} # Piggyback on Whale logic for priority
+                )
+            else:
+                entry_sig = oracle.analyze_for_entry(
+                    symbol, data, bb_vals, obv_slope, metabolism, 
+                    structure_ctx=structure_ctx,
+                    book_data=book_data,
+                    ticker_data=getattr(self, 'session_ticker_data', {}).get(symbol, {}),
+                    pack_stats=getattr(self, 'session_pack_stats', {}),
+                    funding_rate=funding_rate,
+                    observer=observer
+                )
             
             # Inject Whale Signal into Oracle Metadata if Oracle missed it or to reinforce
             if entry_sig:
@@ -1146,6 +1366,21 @@ class TraderHolon(Holon):
 
         portfolio_val = executor.get_portfolio_value(0.0) if executor else 1.0
         
+        # --- NEW: ARCHIPELAGO EVOLUTION STATUS ---
+        evo_stats = {'best_fitness': '0.00', 'kings': '0'}
+        try:
+            hof_path = os.path.join(os.getcwd(), 'hall_of_fame.json')
+            if os.path.exists(hof_path):
+                import json
+                with open(hof_path, 'r') as f:
+                    hof_data = json.load(f)
+                    if isinstance(hof_data, list) and len(hof_data) > 0:
+                        best = hof_data[0]
+                        evo_stats['best_fitness'] = f"{best.get('fitness', 0.0):.2f}"
+                        evo_stats['kings'] = str(len(hof_data))
+        except: pass
+        # ------------------------------------------
+
         self.gui_queue.put({
             'type': 'agent_status',
             'data': {
@@ -1153,6 +1388,8 @@ class TraderHolon(Holon):
                 'gov_alloc': f"{config.GOVERNOR_MAX_MARGIN_PCT*100:.1f}%",
                 'gov_lev': f"{config.PREDATOR_LEVERAGE}x",
                 'gov_trends': str(len(gov.positions)) if gov else "0",
+                'evo_fitness': evo_stats['best_fitness'],
+                'evo_kings': evo_stats['kings'],
                 'gov_micro': f"{'ACTIVE' if config.MICRO_CAPITAL_MODE else 'OFF'}",
                 'risk_budget': f"${gov.risk_budget:.2f}" if gov else "$0.00",
                 'fortress_balance': f"${gov.fortress_balance:.2f}" if gov else "$300.00",

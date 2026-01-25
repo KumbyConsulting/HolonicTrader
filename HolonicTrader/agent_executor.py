@@ -427,12 +427,19 @@ class ExecutorHolon(Holon):
                 # 2. Import this position from exchange
                 direction = 'BUY' if p['side'] == 'long' else 'SELL'
                 entry_price = float(p.get('entryPrice', 0.0))
+                mark_price = float(p.get('markPrice', entry_price))
                 leverage = float(p.get('leverage', 1.0) or 1.0)
+                
+                # --- PATCH: INVALID ENTRY PRICE FALLBACK ---
+                if entry_price <= 0:
+                    entry_price = mark_price
+                if entry_price <= 0:
+                    entry_price = self.latest_prices.get(internal_sym, 0.0)
                 
                 # Check if this differs from what we had before
                 old_qty = old_positions.get(internal_sym, 0.0)
                 if abs(old_qty - size) > 0.0001 or old_qty == 0:
-                    print(f"[{self.name}] 📥 Importing: {internal_sym} ({direction}) Size: {size} Entry: {entry_price}")
+                    print(f"[{self.name}] 📥 Importing: {internal_sym} ({direction}) Size: {size} Entry: {entry_price:.8f}")
                 
                 self.held_assets[internal_sym] = size if direction == 'BUY' else -size
                 self.entry_prices[internal_sym] = entry_price
@@ -455,6 +462,16 @@ class ExecutorHolon(Holon):
                     'strategy': 'RECOVERED',
                     'stack_count': 1 # Default to 1 on fresh import (Can't know history unless mapped)
                 }
+                
+                # --- EQUITY REPAIR FIX: Pre-populate latest_prices ---
+                # Use current markPrice from exchange if available, else entryPrice
+                mark_price = float(p.get('markPrice', entry_price))
+                if mark_price > 0:
+                    self.latest_prices[internal_sym] = mark_price
+                else:
+                    self.latest_prices[internal_sym] = entry_price
+                # -----------------------------------------------------
+                
                 synced_count += 1
                 
             # Report any positions that were in old_positions but NOT re-imported (i.e., ghosts)
@@ -1001,14 +1018,24 @@ class ExecutorHolon(Holon):
             
         elif is_long_exit or is_short_cover:
             # FIX: Distinguish between UNIT Sizing (BUY/SELL) and PERCENT Sizing (EXIT/REDUCE)
-            if action_type in ['BUY', 'SELL']:
+            # 'EXECUTE' and 'REDUCE' usually come from Kelly/Strategy which are Unit-based.
+            # We assume Unit sizing unless explicitly flagged or using special action.
+            if action_type in ['BUY', 'SELL', 'EXECUTE', 'REDUCE']:
                  # Entry Signal acting as Close/Reduce -> Size is UNITS
                  requested_qty = decision.adjusted_size
-                 # Guard: Cannot close more than we hold (unless we implement Flip later)
-                 exec_qty = min(requested_qty, abs(current_holding))
-                 print(f"[{self.name}] 📉 REDUCING: {symbol} Holding {abs(current_holding):.4f} - Req {requested_qty:.4f} -> Closing {exec_qty:.4f}")
+                 
+                 # --- ZOMBIE JANITOR PATCH ---
+                 # If reason is CONSOLIDATION or Thesis, treat adjusted_size as PERCENTAGE (1.0 = 100%)
+                 reason = decision.original_signal.metadata.get('reason')
+                 if reason in ['CONSOLIDATION', 'Thesis']:
+                     exec_qty = abs(current_holding) * requested_qty
+                     print(f"[{self.name}] 🧹 CONSOLIDATION EXIT: {symbol} Closing {exec_qty:.4f} ({requested_qty*100:.0f}%)")
+                 else:
+                     # Guard: Cannot close more than we hold (unless we implement Flip later)
+                     exec_qty = min(requested_qty, abs(current_holding))
+                     print(f"[{self.name}] 📉 REDUCING: {symbol} Holding {abs(current_holding):.4f} - Req {requested_qty:.4f} -> Closing {exec_qty:.4f}")
             else:
-                 # Explicit EXIT/COVER/PANIC -> Size is PERCENTAGE (0.0 - 1.0)
+                 # Explicit EXIT/COVER/PANIC (Custom Actions) -> Size is PERCENTAGE (0.0 - 1.0)
                  exec_qty = abs(current_holding) * decision.adjusted_size
 
             if action_type == 'EXIT': exec_qty = abs(current_holding)
@@ -1034,26 +1061,62 @@ class ExecutorHolon(Holon):
             # ORDER TYPE LOGIC:
             # - ENTRIES (Long/Short) -> MARKET (Priority: Speed/Certainty)
             # - EXITS (Close/Reduce) -> LIMIT (Priority: Rebates/Cost)
-            #   (Unless it's a Stop Loss, which might need Market, but for now Limit w/ actuator retry logic)
             
-            order_type = 'market' if (is_long_entry or is_short_entry) else 'limit'
+            # AEHML UPGRADE: Adaptive Execution
+            # In High Entropy (Chaos), we avoid Market orders to prevent wicks/slippage.
+            entropy_s = decision.entropy_score
+            is_chaos = entropy_s > 1.4 # Config-aligned threshold
+            
+            if is_chaos and (is_long_entry or is_short_entry):
+                 order_type = 'limit'
+                 print(f"[{self.name}] 🌪️ ADAPTIVE EXECUTION: Chaos (Ent {entropy_s:.2f}) -> Forcing LIMIT Entry.")
+            else:
+                 order_type = 'market' if (is_long_entry or is_short_entry) else 'limit'
             
             # Urgent if it's an Exit or Cover (We want to realize PnL, not fish for rebates endlessly)
             urgent_flag = (is_long_exit or is_short_cover)
             
-            # Execute
-            # Execute
-            tx_id = self.actuator.place_order(
-                symbol=symbol,
-                direction=direction, # Actuator handles side map
-                quantity=exec_qty,
-                price=current_price,
-                order_type=order_type,
-                margin=True, 
-                leverage=leverage,
-                urgent=urgent_flag,
-                reduce_only=(is_long_exit or is_short_cover)
-            )
+            # --- AEHML UPGRADE: SMART EXECUTION ROUTER ---
+            # Automatically route to TWAP/VWAP if impact is high
+            is_high_impact = False
+            try:
+                # Ask Actuator for a liquidity pre-check
+                exec_target = config.KRAKEN_SYMBOL_MAP.get(symbol, symbol)
+                is_high_impact = not self.actuator.check_liquidity(exec_target, direction, exec_qty, current_price)
+            except: pass
+
+            if is_high_impact and not urgent_flag:
+                # Use TWAP for large entries to minimize slippage
+                print(f"[{self.name}] 🌊 HIGH IMPACT DETECTED. Routing to TWAP Execution...")
+                algo_id = self.actuator.execute_twap(symbol, direction, exec_qty, duration_seconds=600) # 10m TWAP
+                print(f"[{self.name}] 📡 ALGO START: {algo_id}")
+                
+                # Optimistically update state since it's a background process
+                # (Or track algo status later. For now, assume success for local ledger)
+                # We return a dummy filled record for the ledger
+                fills = [{
+                    'symbol': symbol,
+                    'direction': direction,
+                    'filled_qty': exec_qty,
+                    'price': current_price,
+                    'cost_usd': exec_qty * current_price,
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'algo': True
+                }]
+                tx_id = algo_id
+            else:
+                # Default Standard Execution
+                tx_id = self.actuator.place_order(
+                    symbol=symbol,
+                    direction=direction, # Actuator handles side map
+                    quantity=exec_qty,
+                    price=current_price,
+                    order_type=order_type,
+                    margin=True, 
+                    leverage=leverage,
+                    urgent=urgent_flag,
+                    reduce_only=(is_long_exit or is_short_cover)
+                )
 
             if tx_id is None and (is_long_exit or is_short_cover):
                  print(f"[{self.name}] ⚠️ EXIT FAILED (Likely Sync Issue). Triggering forced reconciliation...")
@@ -1257,7 +1320,7 @@ class ExecutorHolon(Holon):
                 'ppo_conviction': ppo_conv,
                 'stack_count': self.position_metadata.get(symbol, {}).get('stack_count', 0) + 1
             }
-            print(f"[{self.name}] LONG ENTRY: {symbol} @ {actual_price} (Qty: {actual_qty:.4f}, NewTotal: {new_qty:.4f}, Margin: ${margin_impact:.2f})")
+            print(f"[{self.name}] LONG ENTRY: {symbol} @ {actual_price:.8f} (Qty: {actual_qty:.4f}, NewTotal: {new_qty:.4f}, Margin: ${margin_impact:.2f})")
             
             # --- PHASE X: DYNAMIC STOP LOSS ---
             if self.actuator and self.governor:
@@ -1322,7 +1385,7 @@ class ExecutorHolon(Holon):
                 'ppo_conviction': ppo_conv,
                 'stack_count': self.position_metadata.get(symbol, {}).get('stack_count', 0) + 1
             }
-            print(f"[{self.name}] SHORT ENTRY: {symbol} @ {actual_price} (Qty: {actual_qty:.4f}, NewTotal: {new_qty_abs:.4f}, Margin: ${margin_impact:.2f})")
+            print(f"[{self.name}] SHORT ENTRY: {symbol} @ {actual_price:.8f} (Qty: {actual_qty:.4f}, NewTotal: {new_qty_abs:.4f}, Margin: ${margin_impact:.2f})")
 
             # --- PHASE X: DYNAMIC STOP LOSS ---
             if self.actuator and self.governor:
@@ -1446,17 +1509,26 @@ class ExecutorHolon(Holon):
         for sym, qty in self.held_assets.items():
             if abs(qty) < 0.00000001: continue
             
+            # --- EQUITY REPAIR FIX ---
+            # 1. Price Source
             current_price = self.latest_prices.get(sym, 0.0)
             entry_price = self.entry_prices.get(sym, 0.0)
+            
+            # 2. Metadata
             meta = self.position_metadata.get(sym, {})
             leverage = meta.get('leverage', 1.0)
             direction = meta.get('direction', 'BUY')
             
-            # Fallback for Paper Trading Startup: Use entry_price if live price not yet fetched
-            if current_price <= 0 and entry_price > 0:
-                current_price = entry_price
+            # 3. Fallback Logic: Never ignore a position just because price is missing
+            if current_price <= 0:
+                if entry_price > 0:
+                     # Assume flat PnL if no live data (better than 0 equity)
+                     current_price = entry_price
+                else:
+                     # Critical fallback if both missing (shouldn't happen if reconciled)
+                     continue 
             
-            if current_price > 0 and entry_price > 0:
+            if entry_price > 0:
                 qty_abs = abs(qty)
                 # Margin currently locked in this position
                 margin_used = (qty_abs * entry_price) / leverage

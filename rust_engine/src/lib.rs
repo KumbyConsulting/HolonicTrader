@@ -217,14 +217,13 @@ fn run_backtest_fast(
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Len mismatch"));
     }
 
-    // --- STATE MACHINE ---
     let mut balance = initial_capital;
     let mut position: Option<Position> = None;
     let mut trades: Vec<Trade> = Vec::new();
     
-    // Trailing State
     let mut trailing_stop: Option<f64> = None;
     let mut highest_price: f64 = 0.0;
+    let mut pending_signal: i32 = 0;
 
     for i in 0..len {
         let ts = timestamps[i];
@@ -232,54 +231,57 @@ fn run_backtest_fast(
         let h = highs[i];
         let l = lows[i];
         let c = closes[i];
-        let sig = signals[i];
         
-        // -----------------------------
-        // 1. MANAGE EXISTING POSITION
-        // -----------------------------
-        let mut closed_this_tick = false;
-        
+        // --- 1. EXECUTE PENDING SIGNAL (Next-Open Rule) ---
+        if pending_signal != 0 && position.is_none() {
+             if pending_signal == 1 {
+                 // Open Long on o
+                 let price = o;
+                 let cost = balance / (1.0 + (leverage * fee_rate));
+                 let notional = cost * leverage;
+                 let fee = notional * fee_rate;
+                 let quantity = notional / price;
+                 
+                 if quantity > 0.0 {
+                     balance -= cost + fee;
+                     position = Some(Position {
+                         entry_price: price,
+                         entry_time: ts,
+                         quantity,
+                         direction: 1,
+                     });
+                     highest_price = price;
+                     trailing_stop = None;
+                 }
+             }
+             pending_signal = 0;
+        }
+
+        // --- 2. MANAGE POSITION (Intra-Candle) ---
         if let Some(pos) = &position {
-            // A. Liquidation Check
-            // Margin = (Entry * Qty) / Lev
-            // PnL = (Low - Entry) * Qty
-            // Equity = Balance (Cash) + Margin + PnL
-            // NOTE: In this simplified model, 'balance' contains Free Cash.
-            // Locked Margin is not in balance.
-            // So Total Equity = balance + margin_locked + pnl.
-            
+            // A. Liquidation Check (Against Low)
             let margin_locked = (pos.entry_price * pos.quantity) / leverage;
             let current_val_low = l * pos.quantity;
             let entry_val = pos.entry_price * pos.quantity;
             let pnl_low = current_val_low - entry_val; 
+            let total_equity_low = balance + margin_locked + pnl_low;
             
-            let total_equity = balance + margin_locked + pnl_low;
-            let maintenance_margin = margin_locked * 0.5; // 50% MM
-            
-            if total_equity <= maintenance_margin {
-                // ☠️ LIQUIDATION
-                // Lose Margin, Balance stays as is (assuming isolated margin for simplicity)
-                // Actually, if equity < MM, exchange takes remaining margin to cover loss.
-                // We just zero the locked margin and return nothing to balance.
-                
-                // Add Trade Record
+            if total_equity_low <= margin_locked * 0.5 {
                 trades.push(Trade {
                     entry_time: pos.entry_time,
                     exit_time: ts,
                     entry_price: pos.entry_price,
-                    exit_price: l, // Filled at low
-                    pnl: -margin_locked, // Lost the margin
+                    exit_price: l,
+                    pnl: -margin_locked,
                     roi: -100.0,
                     direction: pos.direction,
                 });
-                
+                balance = 0.0; // Account zeroed (simplified)
                 position = None;
-                trailing_stop = None;
-                closed_this_tick = true;
-                continue; // Done with this candle
+                continue;
             }
-            
-            // B. Trailing Stop Update
+
+            // B. Trailing Update (Against High)
             if h > highest_price { highest_price = h; }
             if trail_active > 0.0 {
                 let act_price = pos.entry_price * (1.0 + trail_active);
@@ -290,122 +292,62 @@ fn run_backtest_fast(
                     }
                 }
             }
-            
-            // C. Check Exits (Priority: SL -> Trail -> TP -> Signal)
+
+            // C. Forced Exits (SL, Trail, TP)
             let mut exit_price = 0.0;
-            let mut reason = "";
-            
-            // 1. Hard SL
+            let mut close_type = 0; // 1:SL, 2:Trail, 3:TP, 4:Signal
+
             let sl_price = pos.entry_price * (1.0 - stop_loss);
+            let tp_price = if take_profit > 0.0 { pos.entry_price * (1.0 + take_profit) } else { 0.0 };
+
             if l <= sl_price {
                 exit_price = sl_price;
-                reason = "SL";
-            }
-            // 2. Trailing
-            else if let Some(trail) = trailing_stop {
+                close_type = 1;
+            } else if let Some(trail) = trailing_stop {
                 if l <= trail {
                     exit_price = trail;
-                    reason = "TRAIL";
+                    close_type = 2;
                 }
-            }
-            // 3. Take Profit
-            else if take_profit > 0.0 {
-                let tp_price = pos.entry_price * (1.0 + take_profit);
-                if h >= tp_price {
-                    exit_price = tp_price;
-                    reason = "TP";
-                }
-            }
-            // 4. Signal Exit
-            else if sig == -1 {
+            } else if tp_price > 0.0 && h >= tp_price {
+                exit_price = tp_price;
+                close_type = 3;
+            } else if signals[i] == -1 {
                 exit_price = c;
-                reason = "SIG";
+                close_type = 4;
             }
-            
-            if reason.len() > 0 {
-                // EXECUTE CLOSE
-                // Apply Slippage
-                if reason == "SL" || reason == "TRAIL" { 
-                    exit_price *= 0.9995; // 0.05% slip
+
+            if close_type > 0 {
+                // Apply Slippage (0.1% on stops)
+                if close_type == 1 || close_type == 2 {
+                    exit_price *= 0.999;
                 }
                 
-                let quantity = pos.quantity;
-                let gross_val = quantity * exit_price;
-                let exit_fee = gross_val * fee_rate;
+                let qty = pos.quantity;
+                let gross_val = qty * exit_price;
+                let fee = gross_val * fee_rate;
+                let net_pnl = (exit_price - pos.entry_price) * qty - fee;
                 
-                let cost_val = quantity * pos.entry_price;
-                let margin_locked = cost_val / leverage;
-                
-                let raw_pnl = gross_val - cost_val;
-                let net_pnl = raw_pnl - exit_fee; // Entry fee already paid
-                
-                // Return to Balance: Margin + NetPnL
-                balance += (margin_locked + net_pnl);
-                if balance < 0.0 { balance = 0.0; } // Bankruptcy protection
-                
+                balance += margin_locked + net_pnl;
                 trades.push(Trade {
                     entry_time: pos.entry_time,
                     exit_time: ts,
                     entry_price: pos.entry_price,
-                    exit_price: exit_price,
+                    exit_price,
                     pnl: net_pnl,
                     roi: (net_pnl / margin_locked) * 100.0,
                     direction: pos.direction,
                 });
-                
                 position = None;
-                trailing_stop = None;
-                closed_this_tick = true;
+                continue;
             }
         }
-        
-        // -----------------------------
-        // 2. OPEN NEW POSITION
-        // -----------------------------
-        if !closed_this_tick && position.is_none() && sig == 1 {
-            // BUY SIGNAL
-            let price = c; // Close of signal candle
-            
-            // Calculate Position Size (Full Send)
-            // effective_balance = balance;
-            // notional = balance * leverage;
-            // cost = notional / leverage = balance.
-            // fee = notional * fee_rate.
-            // We need: cost + fee <= balance.
-            
-            // balance = cost + (cost * lev * fee_rate)
-            // balance = cost * (1 + lev * fee_rate)
-            // cost = balance / (1 + lev * fee_rate)
-            
-            let cost = balance / (1.0 + (leverage * fee_rate));
-            let notional = cost * leverage;
-            let fee = notional * fee_rate;
-            let quantity = notional / price;
-            
-            if quantity > 0.0 {
-                balance -= (cost + fee); // Lock margin and pay fee
-                
-                position = Some(Position {
-                    entry_price: price,
-                    entry_time: ts,
-                    quantity,
-                    direction: 1,
-                });
-                
-                highest_price = price;
-                trailing_stop = None;
-            }
+
+        // --- 3. QUEUE NEXT SIGNAL ---
+        if signals[i] == 1 && position.is_none() {
+            pending_signal = 1;
         }
     }
-    
-    // Close at end
-    if let Some(pos) = position {
-        let price = closes[len-1];
-        let margin_locked = (pos.entry_price * pos.quantity) / leverage;
-        let pnl = (price - pos.entry_price) * pos.quantity;
-        balance += (margin_locked + pnl);
-    }
-    
+
     Ok((balance, trades))
 }
 
@@ -699,6 +641,56 @@ fn holonic_speed(m: &Bound<'_, PyModule>) -> PyResult<()> {
     }
 
     m.add_function(wrap_pyfunction!(compute_block_hash, m)?)?;
+
+    // SDE Physics Functions
+    #[pyfunction]
+    fn sde_estimate_ou(prices: Vec<f64>) -> HashMap<String, f64> {
+        math::sde::estimate_ou_parameters(&prices)
+    }
+
+    #[pyfunction]
+    fn sde_estimate_gbm(prices: Vec<f64>) -> HashMap<String, f64> {
+        math::sde::estimate_gbm_parameters(&prices)
+    }
+
+    #[pyfunction]
+    fn sde_simulate_paths(
+        model: String,
+        params: HashMap<String, f64>,
+        start_price: f64,
+        horizon: usize,
+        num_paths: usize,
+    ) -> Vec<Vec<f64>> {
+        math::sde::simulate_paths(&model, params, start_price, horizon, num_paths)
+    }
+
+    #[pyfunction]
+    fn sde_calculate_ruin_probability(
+        model: String,
+        params: HashMap<String, f64>,
+        start_price: f64,
+        sl_price: f64,
+        tp_price: f64,
+        horizon: usize,
+        num_paths: usize,
+    ) -> f64 {
+        math::sde::calculate_ruin_probability(&model, params, start_price, sl_price, tp_price, horizon, num_paths)
+    }
+
+    m.add_function(wrap_pyfunction!(sde_calculate_ruin_probability, m)?)?;
+    
+    // Batch Signal Analysis
+    #[pyfunction]
+    fn calculate_signals_matrix(
+        symbols: Vec<String>,
+        prices: HashMap<String, Vec<f64>>,
+        highs: HashMap<String, Vec<f64>>,
+        lows: HashMap<String, Vec<f64>>,
+    ) -> HashMap<String, HashMap<String, f64>> {
+        math::batch_analysis::calculate_signals_matrix(symbols, prices, highs, lows)
+    }
+    
+    m.add_function(wrap_pyfunction!(calculate_signals_matrix, m)?)?;
 
     Ok(())
 }

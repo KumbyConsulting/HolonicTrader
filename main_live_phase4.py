@@ -19,6 +19,7 @@ from HolonicTrader.agent_sentiment import SentimentHolon
 from HolonicTrader.agent_overwatch import OverwatchHolon # <--- NEW: The Sentry
 from HolonicTrader.agent_whale import WhaleHolon # <--- NEW: The Harpoon
 from HolonicTrader.agent_structure import CTKSStrategicHolon # <--- NEW: The Institution
+from HolonicTrader.agent_arbitrage import ArbitrageHolon # <--- NEW: The Yield Hunter
 
 from database_manager import DatabaseManager
 
@@ -144,6 +145,7 @@ def main_live(status_queue: Queue = None, stop_event: threading.Event = None, in
 
     # 1. Instantiate Core Agents
     observer = ObserverHolon(exchange_id='kucoin')
+    kraken_observer = ObserverHolon(exchange_id='krakenfutures')
     entropy = EntropyHolon()
     topology = TopologyHolon() # <--- AEHML 2.0
     oracle = EntryOracleHolon()
@@ -153,6 +155,13 @@ def main_live(status_queue: Queue = None, stop_event: threading.Event = None, in
     sentiment = SentimentHolon() 
     whale = WhaleHolon() 
     structure = CTKSStrategicHolon() 
+    arbitrage = ArbitrageHolon()
+    arbitrage.kucoin_observer = observer
+    arbitrage.kraken_observer = kraken_observer
+    
+    # --- PHASE 46.2: ACTIVATE HIGH-FREQUENCY STREAMS ---
+    observer.start_ws(config.ALLOWED_ASSETS)
+    kraken_observer.start_ws(config.ALLOWED_ASSETS)
     
     # 2. Instantiate Execution Stack
     governor = GovernorHolon(initial_balance=config.INITIAL_CAPITAL, db_manager=db)
@@ -204,9 +213,11 @@ def main_live(status_queue: Queue = None, stop_event: threading.Event = None, in
     regime_controller = RegimeController()
     governor.regime_controller = regime_controller  # Link to Governor
 
-    # 3. Instantiate Trader
+    # 3. Instantiate Trader (Dynamically select primary observer based on mode)
+    primary_observer = kraken_observer if config.TRADING_MODE == 'FUTURES' else observer
+    
     trader = TraderHolon("TraderNexus", sub_holons={
-        'observer': observer,
+        'observer': primary_observer,
         'entropy': entropy,
         'topology': topology, # <--- Added to Nexus
         'oracle': oracle,
@@ -219,7 +230,8 @@ def main_live(status_queue: Queue = None, stop_event: threading.Event = None, in
         'overwatch': overwatch,
         'regime': regime_controller,
         'whale': whale,
-        'structure': structure 
+        'structure': structure,
+        'arbitrage': arbitrage
     })
 
     trader_ref_linked = False
@@ -251,6 +263,8 @@ def main_live(status_queue: Queue = None, stop_event: threading.Event = None, in
         try:
             if overwatch:
                 overwatch.stop()
+            if 'actuator' in locals() and actuator:
+                actuator.stop_all_algos()
         except Exception:
              pass
              

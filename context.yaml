@@ -1,0 +1,170 @@
+# ==============================================================================
+#  AEHML TRADING SYSTEM CONFIGURATION (Kraken Futures v3 Compliance)
+# ==============================================================================
+
+system_meta:
+  version: "2.0.0-entropy-beta"
+  environment: "production"
+  exchange: "kraken_futures"
+  base_currency: "USD"
+
+# ------------------------------------------------------------------------------
+# 1. API CONNECTION SETTINGS
+# ------------------------------------------------------------------------------
+api:
+  rest_url: "https://futures.kraken.com/derivatives/api/v3"
+  websocket_url: "wss://futures.kraken.com/ws/v1"
+  
+  authentication:
+    api_key_env: "KRAKEN_API_KEY"
+    api_secret_env: "KRAKEN_API_SECRET"
+    headers:
+      api_key: "API-Key"
+      api_sign: "API-Sign"
+      
+  rate_limits:
+    rest:
+      general: 500  # requests per 10 seconds
+      order_placement: 100 # cost per minute
+    websocket:
+      connection_limit: 100
+      max_subscriptions: 100
+
+# ------------------------------------------------------------------------------
+# 2. DATA COLLECTION (Scout Holon)
+# ------------------------------------------------------------------------------
+data_feed:
+  # Market Symbols (Check /derivatives/api/v3/instruments for exact IDs)
+  # Format: [Type]_[Base][Quote] (e.g., PF_BTCUSD for Perp Futures)
+  active_universe:
+    - "PF_BTCUSD"
+    - "PF_ETHUSD"
+    - "PF_SOLUSD"
+    - "PF_XRPUSD"
+    - "PF_DOGEUSD"
+
+  websocket_subscriptions:
+    - channel: "ticker"
+      fields: ["bid", "ask", "last", "markPrice", "volume"]
+    - channel: "trade"
+      fields: ["price", "size", "side", "time"]
+    - channel: "book"
+      depth: 10 # Optimize for entropy calculation speed
+
+  historical_data:
+    endpoint: "/market/ohlcv"
+    intervals:
+      micro: "5m"   # For Volatility Scoring
+      meso: "1h"    # For Entropy Structure Scoring
+      macro: "4h"   # For Trend Validation
+
+# ------------------------------------------------------------------------------
+# 3. ENTROPY SCOUTER (New Feature)
+# ------------------------------------------------------------------------------
+entropy_scouter:
+  enabled: true
+  scan_interval_seconds: 60
+  
+  metrics:
+    sample_entropy:
+      m: 2          # Pattern length
+      r_sigma: 0.2  # Tolerance (0.2 * std_dev)
+    permutation_entropy:
+      order: 4      # Ordinal pattern length
+      delay: 1
+  
+  # Structural Thresholds (Defining Regimes)
+  regimes:
+    low_entropy:     # "The Train" - Strong Trend
+      threshold_max: 0.6
+      action: "trend_following"
+      leverage_scalar: 5.0
+      
+    medium_entropy:  # "Normal Market"
+      threshold_min: 0.61
+      threshold_max: 1.5
+      action: "standard"
+      leverage_scalar: 3.3
+      
+    high_entropy:    # "The Casino" - Chaos
+      threshold_min: 1.51
+      action: "mean_reversion_or_pass"
+      leverage_scalar: 1.0 # Spot/1x only
+      
+  alerts:
+    # Detects rapid organization of chaos (Squeeze Warning)
+    entropy_compression:
+      lookback_periods: 4
+      drop_percentage: 40.0 # % drop in entropy score
+
+# ------------------------------------------------------------------------------
+# 4. EXECUTOR AGENT (Holon Logic)
+# ------------------------------------------------------------------------------
+executor:
+  account_size: 300.00
+  max_risk_per_trade_percent: 2.0 # $6.00 max loss
+  
+  margin_settings:
+    default_mode: "isolated" # Kraken API: 'isolated' or 'cross'
+    leverage_limit: 5        # Hard cap for $300 account
+  
+  # Dynamic Order Mapping based on Entropy Regimes
+  scenarios:
+    # Scenario 1: Low Entropy Breakout
+    momentum_breakout:
+      condition_entropy: "< 0.6"
+      order_type: "stop-loss"   # Kraken 'Stop Entry' logic
+      trigger_signal: "mark"    # Use mark price to avoid wicks
+      trigger_offset_percent: 0.2
+      reduce_only: false
+      
+    # Scenario 2: High Entropy Fishing
+    mean_reversion:
+      condition_entropy: "> 1.5"
+      order_type: "limit"
+      post_only: true           # REJECT if taker (saves fees)
+      offset_from_bollinger: 1.0 # Standard deviations
+      
+    # Scenario 3: Topology Collapse (Emergency)
+    crash_protection:
+      condition_topology: "collapse" # From TDA module
+      order_type: "market"
+      reduce_only: true         # GUARANTEE exit only
+      size_percent: 100         # Close everything
+
+# ------------------------------------------------------------------------------
+# 5. RISK MANAGEMENT (Governor Holon)
+# ------------------------------------------------------------------------------
+risk_management:
+  stop_loss:
+    mode: "dynamic" # Based on entropy
+    tight_sl_percent: 0.5   # For Low Entropy/High Lev
+    wide_sl_percent: 2.0    # For High Entropy/Low Lev
+    
+  take_profit:
+    default_rr_ratio: 2.0   # Target 2:1 Reward/Risk
+    
+  drawdown_lock:
+    enabled: true
+    max_drawdown_percent: 25.0
+    action: "halt_trading"
+
+  # Position Sizing Formula: (Risk $ / SL Distance %)
+  sizing:
+    target_profit_growth: 5.0 # % Target per trade attempt
+    implied_notional_size: 1500.00 # For Low Entropy setups
+
+# ------------------------------------------------------------------------------
+# 6. LOGGING & MONITORING
+# ------------------------------------------------------------------------------
+logging:
+  level: "INFO"
+  file_path: "./logs/trading_session.log"
+  log_trades_to_db: true
+  
+  alerts:
+    channels: ["telegram", "email"]
+    triggers:
+      - "margin_level_below_50"
+      - "entropy_compression_detected"
+      - "topology_collapse_imminent"

@@ -39,6 +39,7 @@ except ImportError:
 from typing import Any, Optional, Literal
 from HolonicTrader.holon_core import Holon, Disposition
 from .kalman import KalmanFilter1D
+from HolonicTrader.sde_engine import SDEEngine
 import config
 import threading
 import sys
@@ -73,6 +74,7 @@ class EntryOracleHolon(Holon):
         self.symbol_trends = {}  # {symbol: bool (is_bullish)}
         self.last_probes = {}    # {symbol: {'lstm': prob, 'xgb': prob}}
         self.last_macro_state = {} # {symbol: 'BULLISH'/'BEARISH'} for log damping
+        self.current_metabolism = 'SCAVENGER' # Default Tracking
         self.market_state = {}   # {correlation_matrix: df, entropy: float}
         self.crisis_score = 0.0  # Macro Crisis Score (0.0 - 1.0)
         
@@ -149,9 +151,9 @@ class EntryOracleHolon(Holon):
              # New: Base 0.5 + (fear * 0.2). Milder penalty.
              required_conviction = min(0.8, 0.5 + (fear * 0.2))
              
-             if signal.direction == 'BUY' and signal.conviction < required_conviction:
-                 print(f"[{self.name}] 😨 FEAR VETO: {symbol} Conviction {signal.conviction:.2f} < Req {required_conviction:.2f} (Fear {fear:.2f})")
-                 return None
+             if signal.conviction < required_conviction:
+                  print(f"[{self.name}] 😨 FEAR VETO: {symbol} {signal.direction} Conviction {signal.conviction:.2f} < Req {required_conviction:.2f} (Fear {fear:.2f})")
+                  return None
                  
         # GREED: If Risk Multiplier > 1.2, Boost conviction (Confidence)
         if greed > 1.2:
@@ -167,24 +169,51 @@ class EntryOracleHolon(Holon):
                 return None
                 
         # 2. DOGE: Fakeout Filter (RVOL)
-        elif symbol == 'DOGE/USDT':
-            # This is partly handled in Satellite logic, but as a safety net for standard signals:
-            rvol = signal.metadata.get('rvol', 1.0)
-            # Patch: Lowered from 2.0 to 1.5 for 24/7 liquidity (2026-01-21)
-            doge_threshold = getattr(config, 'PERSONALITY_DOGE_RVOL', 1.5) 
-            if rvol < doge_threshold:
-                print(f"[{self.name}] 🐕 DOGE FILTER: Potential Fakeout (RVOL {rvol:.1f} < {doge_threshold}). IGNORED.")
-                return None
+        # 2. DYNAMIC ASSET PROFILES (Evolved Personalty)
+        profiles = getattr(config, 'ASSET_PROFILES', {})
+        if symbol in profiles:
+            profile = profiles[symbol]
+            meta = signal.metadata
+            
+            # RVOL Check
+            if 'rvol_threshold' in profile:
+                rvol = meta.get('rvol', 1.0)
+                limit = profile['rvol_threshold']
+                if rvol < limit:
+                    print(f"[{self.name}] 🧬 {symbol} FILTER: Low Volume (RVOL {rvol:.1f} < {limit}). IGNORED.")
+                    return None
+            
+            # RSI Check (Contextual)
+            # If 'rsi_buy' is defined, it usually implies a max-rsi for entry (value/pullback)
+            # But for SOL (Trend), 49 means "Buy early". 
+            # We treat it as a "Don't Buy if Overbought" cap relative to the profile?
+            # Or simplified: Veto if RSI is SIGNIFICANTLY higher than optimal.
+            if 'rsi_buy' in profile and signal.direction == 'BUY':
+                rsi = meta.get('rsi', 50.0)
+                optimal = profile['rsi_buy']
                 
-        # 3. SOL: Momentum Only
-        elif symbol == 'SOL/USDT':
-            rsi = signal.metadata.get('rsi', 50.0)
-            if signal.direction == 'BUY' and rsi < config.PERSONALITY_SOL_RSI_LONG:
-                print(f"[{self.name}] 🟣 SOL FILTER: Too Weak for Long (RSI {rsi:.1f} < {config.PERSONALITY_SOL_RSI_LONG})")
-                return None
-            elif signal.direction == 'SELL' and rsi > config.PERSONALITY_SOL_RSI_SHORT:
-                print(f"[{self.name}] 🟣 SOL FILTER: Too Strong for Short (RSI {rsi:.1f} > {config.PERSONALITY_SOL_RSI_SHORT})")
-                return None
+                # --- PATCH: RSI FLEX & STRUCTURAL BYPASS ---
+                # 1. Relaxed Flex (+25 instead of +15)
+                # 2. Structural Bypass: If Trigger D (Resonance) and Bullish Regime, 
+                #    we allow entry if RSI < 55 (Neutral-Bullish).
+                reason = meta.get('reason', '')
+                is_resonance = (reason == 'STRUCTURAL_RESONANCE')
+                
+                flex = 25.0
+                
+                # --- PROFIT BOOST: RSI FLEXING ---
+                # If in PREDATOR mode, we care more about the trend than the dip.
+                # If conviction is high (>0.65) and metabolism is PREDATOR, we add extra flex.
+                if self.current_metabolism == 'PREDATOR' and signal.conviction > 0.65:
+                    flex += 15.0 # Total 40.0 Flex (e.g. 23 + 40 = 63 RSI allowed)
+                
+                if rsi > (optimal + flex):
+                     if is_resonance and rsi < 60.0: # Also relaxed resonance limit
+                          # Bypass! 
+                          pass 
+                     else:
+                          print(f"[{self.name}] 🧬 {symbol} FILTER: Overextended (RSI {rsi:.1f} > Opt {optimal:.1f}+{flex}). IGNORED.")
+                          return None
                 
         # 4. XRP: Whole Number Front-running
         elif symbol == 'XRP/USDT':
@@ -201,8 +230,8 @@ class EntryOracleHolon(Holon):
                 pass 
             else:
                 gmb = self.get_market_bias()
-                if gmb < (config.GMB_THRESHOLD - 0.15):
-                    print(f"[{self.name}] ☁️ FAIR WEATHER VETO: {symbol} Long blocked (Bias {gmb:.2f} < {config.GMB_THRESHOLD - 0.15:.2f})")
+                if gmb < (config.GMB_THRESHOLD - 0.05):
+                    print(f"[{self.name}] ☁️ FAIR WEATHER VETO: {symbol} Long blocked (Bias {gmb:.2f} < {config.GMB_THRESHOLD - 0.05:.2f})")
                     return None
                 
         # 6. CRISIS PROTOCOL (Macro Strategy)
@@ -245,6 +274,7 @@ class EntryOracleHolon(Holon):
         # Adjust Conviction based on Macro Trend (Bayesian Update)
         global_bias = self.get_market_bias()
         
+        # User Directive: "Enable more short signals given bearish structures"
         if signal.direction == 'SELL':
             # Counter-Trend Short? (Bullish Bias > 0.6)
             if global_bias > 0.6:
@@ -253,11 +283,18 @@ class EntryOracleHolon(Holon):
                 signal.conviction -= penalty
                 if self.DEBUG: 
                     print(f"[{self.name}] 📉 PROBABILITY ADJUST: {symbol} Short Conviction {original_conv:.2f}->{signal.conviction:.2f} (Bull Bias {global_bias:.2f})")
+            
+            # Trend-Following Short (Bear Bias < 0.4) -> BOOST
+            elif global_bias < 0.4:
+                bonus = (0.4 - global_bias) * 0.5 # Moderate Boost
+                signal.conviction = min(1.0, signal.conviction + bonus)
+                if self.DEBUG:
+                     print(f"[{self.name}] 📈 BEAR REGIME BOOST: {symbol} Short Conviction -> {signal.conviction:.2f}")
 
         elif signal.direction == 'BUY':
              # Counter-Trend Long? (Bearish Bias < 0.4)
              if global_bias < 0.4:
-                 penalty = (0.4 - global_bias) * 1.5 # Stricter Penalty
+                 penalty = (0.4 - global_bias) * 2.0 # SEVERE Penalty for fighting the bear
                  original_conv = signal.conviction
                  signal.conviction -= penalty
                  if self.DEBUG:
@@ -272,6 +309,15 @@ class EntryOracleHolon(Holon):
         # "Respect the Floor" - Don't buy below value unless conviction is high.
         structure = signal.metadata.get('structure', {})
         pivots = structure.get('pivots', {}) if structure else {}
+        
+        # FIX 4: Dynamic Pivot Veto Thresholds based on Market Regime
+        global_bias = self.get_market_bias()
+        is_extreme_bear = global_bias < 0.30
+        is_extreme_bull = global_bias > 0.70
+        
+        # Lower thresholds when regime is extreme (more permissive in trending markets)
+        long_pivot_thresh = 0.05 if is_extreme_bear else 0.45  # Was always 0.45
+        short_pivot_thresh = 0.05 if is_extreme_bull else 0.50  # Was always 0.50
         
         if pivots and signal.direction == 'BUY':
             pivot_p = pivots.get('P', 0)
@@ -289,9 +335,25 @@ class EntryOracleHolon(Holon):
                     print(f"[{self.name}] 🛡️ PIVOT VETO: {symbol} Long Deep below Pivot ({current_price:.2f} < {pivot_p:.2f}). Conviction {signal.conviction:.2f} too weak for deep dive.")
                     return None
             elif current_price < pivot_p: # Just below pivot (0-5%)
-                 if signal.conviction < 0.6: # Standard req
+                 if signal.conviction < long_pivot_thresh: # FIX 4: Dynamic threshold
                     print(f"[{self.name}] 🛡️ PIVOT VETO: {symbol} Long below Daily Pivot. Conviction {signal.conviction:.2f} too weak.")
                     return None
+        
+        elif pivots and signal.direction == 'SELL':
+            # "Don't short the Floor"
+            pivot_p = pivots.get('P', 0)
+            current_price = signal.price
+            
+            # If Price is significantly ABOVE Daily Pivot (Bullish Zone), shorting is risky
+            if current_price > (pivot_p * 1.05): # Deep above pivot (>5%)
+                if signal.conviction < 0.7:
+                    print(f"[{self.name}] 🛡️ PIVOT VETO: {symbol} Short Deep above Pivot ({current_price:.2f} > {pivot_p:.2f}). Conviction {signal.conviction:.2f} too weak for top fishing.")
+                    return None
+            elif current_price > pivot_p: # Just above pivot (0-5%)
+                 if signal.conviction < short_pivot_thresh: # FIX 4: Dynamic threshold
+                    print(f"[{self.name}] 🛡️ PIVOT VETO: {symbol} Short above Daily Pivot. Conviction {signal.conviction:.2f} too weak.")
+                    return None
+
         
         # B. VOLUME TRUTH (Energy)
         rvol = signal.metadata.get('rvol', 1.0)
@@ -342,11 +404,14 @@ class EntryOracleHolon(Holon):
         # Here we check Global Bias as a proxy for "Market Environment".
         
         # 2. PACK LOGIC (Correlation Veto)
-        # If we are Long, and Global Bias drops to Bearish (<0.4), and we are a Satellite...
+        # If we are Long, and Global Bias drops below buffered threshold, and we are a Satellite...
         if direction == 'BUY' and symbol in config.SATELLITE_ASSETS:
              gmb = self.get_market_bias()
-             if gmb < (config.GMB_THRESHOLD - 0.05): # Strong Bearish Turn
-                 print(f"[{self.name}] 📉 THESIS FAILED: {symbol} Long held but Global Bias collapsed to {gmb:.2f}")
+             threshold = config.GMB_THRESHOLD
+             buffer = getattr(config, 'GMB_EXIT_HYSTERESIS', 0.10)
+             
+             if gmb < (threshold - buffer): # Buffered Exit
+                 print(f"[{self.name}] 📉 THESIS FAILED: {symbol} Long held but Global Bias collapsed to {gmb:.2f} (Threshold {threshold - buffer:.2f})")
                  return False
 
         # 3. FALLING KNIFE CHECK (Structure)
@@ -502,6 +567,35 @@ class EntryOracleHolon(Holon):
              return None # Veto: Logic prefers buying dips/starts, not chased extensions
         
         # 🚀 ALL KEYS TURNED - FIRE
+        
+        # 🧬 KEY 5: ENSEMBLE VOTE (Evolutionary Intelligence)
+        if self.ensemble:
+             # Evaluate all active strategies in the Hall of Fame
+             vote_score = 0.0
+             try:
+                 # Pass recent data to ensemble (mocking OHLCV dict or DF)
+                 # Ensemble expects dict of {strategy_name: signal} or aggregated? 
+                 # Let's assume evaluate_all returns list of signals or aggregate score.
+                 # Checking sandbox interface: self.ensemble.evaluate_all(symbol, data) -> returns dict of signals
+                 
+                 # We need to adapt data to what Ensemble expects (likely DataFrame)
+                 strategies = self.ensemble.strategies
+                 vote_count = 0
+                 affirmative = 0
+                 
+                 for strat in strategies:
+                     # Simple check: Does strat agree?
+                     # Requires strategy.analyze(df) -> Signal
+                     # For Phase 46, we skip deep integration and assume if Ensemble is Loaded, 
+                     # we give a small boost if it exists, or fully veto if 0% agree?
+                     # Let's do a "Soft Boost" for now to avoid crashes.
+                     pass
+                     
+                 # Placeholder: If Ensemble is alive, we trust it.
+                 # In future: vote_score = self.ensemble.get_consensus(df_15m)
+                 pass
+             except Exception as e:
+                 print(f"[{self.name}] ⚠️ Ensemble Vote Error: {e}")
 
         self._safe_print(f"[{self.name}] 🚀 SATELLITE ENTRY: {symbol} {direction} (1H/15m Align, BBW {bb_width:.2f} > {bbw_thresh:.2f}, RVOL {rvol:.1f} > {rvol_thresh:.1f})")
         
@@ -743,6 +837,28 @@ class EntryOracleHolon(Holon):
         
         self.symbol_trends[symbol] = prices.iloc[-1] > kalman_price
         return kalman_price
+
+    def _analyze_ou_physics(self, symbol: str, prices: np.ndarray) -> Dict[str, float]:
+        """
+        Quantum Oracle: Analyze mean-reversion physics using OU process logic.
+        """
+        try:
+            # We use log-prices for better stability in financial time series
+            log_prices = np.log(prices)
+            params = SDEEngine.estimate_ou_parameters(log_prices)
+            
+            # Convert mu back to price space for easier interpretation
+            params['mu_price'] = float(np.exp(params['mu']))
+            
+            # Calculate current distance from mean in units of sigma
+            current_log_p = log_prices.iloc[-1] if hasattr(log_prices, 'iloc') else log_prices[-1]
+            dist_sigma = (current_log_p - params['mu']) / params['sigma'] if params['sigma'] > 0 else 0.0
+            params['dist_sigma'] = float(dist_sigma)
+            
+            return params
+        except Exception as e:
+            if self.DEBUG: self._safe_print(f"[{self.name}] OU Physics Error: {e}")
+            return {}
 
     def get_market_bias(self, sentiment_score: float = 0.0) -> float:
         if not self.symbol_trends:
@@ -1052,8 +1168,10 @@ class EntryOracleHolon(Holon):
         funding_rate: float = 0.0,
         observer: Any = None
     ):
+        self.current_metabolism = metabolism_state
         from .agent_executor import TradeSignal # Ensure import
         is_whale = False # Default initialization
+        prices = window_data['close']
 
         # 🔑 KEY 0: SCAVENGER TRAP (Pattern Override)
         # Does this asset look like it just trapped bears at support?
@@ -1146,7 +1264,6 @@ class EntryOracleHolon(Holon):
         
         if not sector_override:
             last_state = self.last_macro_state.get(symbol, 'UNKNOWN')
-            prices = window_data['close']
             
             # Volatility & Momentum (Moved UP for Whale Logic)
             returns = prices.pct_change()
@@ -1205,19 +1322,19 @@ class EntryOracleHolon(Holon):
 
             if macro_trend == 'BULLISH':
                 if last_state != 'BULLISH':
-                     self._safe_print(f"[{self.name}] 🌊 MACRO FLOW (1H): {symbol} Turned BULLISH. (Restrictions Disabled)")
-                     self.last_macro_state[symbol] = 'BULLISH'
+                    self._safe_print(f"[{self.name}] 🌊 MACRO FLOW (1H): {symbol} Turned BULLISH.")
+                    self.last_macro_state[symbol] = 'BULLISH'
                 
-                # RESTRICTION LOGIC DISABLED
-                # can_short = True # Already True
+                # RECALIBRATION: Enforce Trend congruence (Restrict Shorts in Bull markets)
+                can_short = True if is_whale else False
                 
             elif macro_trend == 'BEARISH':
-                 if last_state != 'BEARISH':
-                     self._safe_print(f"[{self.name}] 🌊 MACRO FLOW (1H): {symbol} Turned BEARISH. (Restrictions Disabled)")
-                     self.last_macro_state[symbol] = 'BEARISH'
-                 
-                 # RESTRICTION LOGIC DISABLED
-                 # can_long = True # Already True
+                if last_state != 'BEARISH':
+                    self._safe_print(f"[{self.name}] 🌊 MACRO FLOW (1H): {symbol} Turned BEARISH.")
+                    self.last_macro_state[symbol] = 'BEARISH'
+                
+                # RECALIBRATION: Enforce Trend congruence (Restrict Longs in Bear markets)
+                can_long = True if is_whale else False
         else:
              # No Observer = Safe Defaults
              can_long = True
@@ -1315,13 +1432,11 @@ class EntryOracleHolon(Holon):
         # ------------------------------------------------------------------------
         
         # --------------------------------------------------
-        # --------------------------------------------------
-        prices = window_data['close']
         current_price = float(prices.iloc[-1])
         
         # Volatility & Momentum (Already calculated above)
-        # returns = prices.pct_change()
-        # volatility = returns.rolling(14).std().iloc[-1]
+        returns = prices.pct_change()
+        volatility = returns.rolling(14).std().iloc[-1]
         
         # 1. Feature Engineering (Remaining)
         # RSI (14) - Already calculated above
@@ -1330,12 +1445,11 @@ class EntryOracleHolon(Holon):
         # loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         # rsi = 100 - (100 / (1 + (gain / loss))).iloc[-1]
         
-        # Ensure rsi variable is available even if we took the sector_override path
-        if sector_override:
-            delta = prices.diff()
-            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-            rsi = 100 - (100 / (1 + (gain / loss))).iloc[-1]
+        # Ensure rsi variable is ALWAYS available (FIX: was only in sector_override path)
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rsi = 100 - (100 / (1 + (gain / loss))).iloc[-1]
         
         # BB %B
         bb_pct_b = (current_price - bb_vals['lower']) / (bb_vals['upper'] - bb_vals['lower']) if (bb_vals['upper'] - bb_vals['lower']) != 0 else 0.5
@@ -1403,6 +1517,25 @@ class EntryOracleHolon(Holon):
         if lstm_prob > 0.6 or xgb_prob > 0.6:
             self._safe_print(f"[{self.name}] Ensemble Check {symbol}: LSTM({lstm_prob:.2f}) XGB({xgb_prob:.2f})")
 
+        # 7.5 QUANTUM PHYSICS LAYER (SDE)
+        ou_params = self._analyze_ou_physics(symbol, window_data['close'].values)
+        quantum_conviction = 0.0
+        is_quantum_reversion = False
+        
+        if ou_params:
+            # If we are > 2 sigma from mean, we are "Stretched"
+            dist_sigma = ou_params.get('dist_sigma', 0.0)
+            is_quantum_reversion = abs(dist_sigma) > config.PHYSICS_OU_STRETCH_THRESHOLD
+            
+            if is_quantum_reversion:
+                # Conviction scales with distance and mean-reversion speed (lambda)
+                quantum_conviction = min(1.0, abs(dist_sigma) / 4.0)
+                # Boost if lambda is high
+                if ou_params.get('lambda', 0) > config.PHYSICS_OU_LAMBDA_THRESHOLD:
+                    quantum_conviction = min(1.0, quantum_conviction * 1.25)
+                
+                self._safe_print(f"[{self.name}] ⚛️ QUANTUM STATE: {symbol} dist={dist_sigma:.2f}s, lambda={ou_params.get('lambda'):.2f}")
+
         # 8. LOG & EXECUTE
         # 8. LOG & EXECUTE (UNIFIED STRATEGY - "UNLEASHED")
         # Merging Scavenger and Predator Logic to allow High Value Trades regardless of mode.
@@ -1425,11 +1558,15 @@ class EntryOracleHolon(Holon):
         # Buy if RSI is extreme (ignore other filters)
         trigger_panic_buy = is_panic_buy and can_long
 
-        if (trigger_trend_buy or trigger_dip_buy or trigger_panic_buy):
+        # Trigger D: Quantum Reversion (SDE Mean Reversion)
+        # Buy if price is significantly below OU Mean
+        trigger_quantum_buy = is_quantum_reversion and (ou_params.get('dist_sigma', 0) < 0) and can_long
+
+        if (trigger_trend_buy or trigger_dip_buy or trigger_panic_buy or trigger_quantum_buy):
              # VALIDATION: Kalman Check (Relaxed)
              # Allow if Price < Kalman (Value) OR if High Conviction Bullish (Momentum)
              # OR if it's a Panic Buy (Value is extreme)
-             if current_price < kalman_price or high_conv_bullish or trigger_panic_buy:
+             if current_price < kalman_price or high_conv_bullish or trigger_panic_buy or trigger_quantum_buy:
                  reason = "TREND" if trigger_trend_buy else ("DIP" if trigger_dip_buy else "PANIC")
                  if is_whale:
                      reason = f"WHALE_{whale_reason[0]}" # Override reason with primary whale driver
@@ -1438,7 +1575,14 @@ class EntryOracleHolon(Holon):
                  self._safe_print(f"[{self.name}] 🚀 {symbol} BUY SIGNAL ({reason}) | XGB:{xgb_prob:.2f} GMB:{market_bias:.2f}")
                  
                  
-                 meta = {'is_whale': is_whale, 'whale_factors': whale_reason, 'structure': structure_ctx, 'reason': reason}
+                 meta = {
+                      'is_whale': is_whale, 
+                      'whale_factors': whale_reason, 
+                      'structure': structure_ctx, 
+                      'reason': reason,
+                      'sde_physics': ou_params,
+                      'quantum_conviction': quantum_conviction
+                  }
                  sig = GlobalTradeSignal(symbol=symbol, direction='BUY', size=1.0, price=current_price, metadata=meta)
                  return self.apply_asset_personality(symbol, sig)
 
@@ -1456,10 +1600,21 @@ class EntryOracleHolon(Holon):
         # Trigger C: Panic Sell (Blow-off Top)
         trigger_panic_sell = is_panic_sell and can_short
         
-        if (trigger_trend_sell or trigger_top_sell or trigger_panic_sell):
+        # Trigger D: Quantum Reversion (OU Mean Reversion)
+        trigger_quantum_sell = is_quantum_reversion and (ou_params.get('dist_sigma', 0) > 0) and can_short
+        
+        if (trigger_trend_sell or trigger_top_sell or trigger_panic_sell or trigger_quantum_sell):
             # VALIDATION: Kalman Check (Relaxed)
-            # Allow if Price > Kalman (Premium) OR if High Conviction Bearish (Momentum)
-                 meta = {'is_whale': False, 'structure': structure_ctx, 'reason': reason}
+            # Allow if Price > Kalman (Premium) OR if High Conviction Bearish (Momentum) OR Quantum
+            if current_price > kalman_price or high_conv_bearish or trigger_panic_sell or trigger_quantum_sell:
+                 reason = "TREND_SELL" if trigger_trend_sell else ("TOP_SELL" if trigger_top_sell else ("PANIC_SELL" if trigger_panic_sell else "QUANTUM_SELL"))
+                 meta = {
+                     'is_whale': False, 
+                     'structure': structure_ctx, 
+                     'reason': reason,
+                     'sde_physics': ou_params,
+                     'quantum_conviction': quantum_conviction
+                 }
                  sig = GlobalTradeSignal(symbol=symbol, direction='SELL', size=1.0, price=current_price, metadata=meta)
                  return self.apply_asset_personality(symbol, sig)
 

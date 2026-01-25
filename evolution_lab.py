@@ -3,10 +3,13 @@ import copy
 import json
 import logging
 import os
+import math
+import numpy as np
 from typing import List, Dict, Optional
 from sandbox.playground import Playground
-from sandbox.playground import Playground
 from sandbox.strategies.evo_strategy import EvoStrategy
+from HolonicTrader.data_guard import DataGuard
+from HolonicTrader.asset_profiler import AssetProfiler
 import config
 
 # Logger configured by parent (run_evolution_loop.py)
@@ -32,6 +35,8 @@ class EvolutionLab:
         self.population: List[Dict] = []
         self.hall_of_fame: List[Dict] = [] # Memory: Top Genomes
         self.best_overall: Optional[Dict] = None
+        self.guard = DataGuard()
+        self.profiler = AssetProfiler()
 
     def load_data(self, history_limit: int = 1500, secondary_limit: int = 6000):
         """Pre-load data for all arenas."""
@@ -40,6 +45,11 @@ class EvolutionLab:
             p = Playground(symbol=sym, initial_capital=self.initial_capital, verbose=False, leverage=self.leverage)
             p.load_data(limit=history_limit)
             p.load_secondary_data(limit=secondary_limit)
+            
+            # Profile Asset
+            if p.df is not None and not p.df.empty:
+                self.profiler.calculate_profile(sym, p.df)
+                
             self.datasets[sym] = p
         logger.info("✅ Data Loaded.")
 
@@ -55,10 +65,38 @@ class EvolutionLab:
             'sat_bb_expand': random.uniform(0.05, 0.25),
             
             # --- INSTITUTIONAL GENES ---
-            'leverage_cap': 1.0, # FORCE 1x LEVERAGE (Benchmark Mode)
-            'trailing_activation': random.uniform(1.5, 3.0),
-            'trailing_distance': random.uniform(0.2, 0.5)
+            'leverage_cap': round(random.uniform(1.0, 5.0), 2),
+            'trailing_activation': random.uniform(0.1, 1.5), # RECALIBRATED: 10% - 150% gain
+            'trailing_distance': random.uniform(0.01, 0.05)  # RECALIBRATED: 1% - 5% trail
         }
+
+    def normalize_gene(self, key: str, value: float) -> float:
+        """Apply biological limits to prevent parameter explosion."""
+        if key == 'rsi_buy':
+            return max(10.0, min(60.0, value))
+        elif key == 'rsi_sell':
+            return max(40.0, min(90.0, value))
+        elif key == 'stop_loss':
+            # Hard Limit: 0.5% to 10% (Prevent 0.0001% stops that trigger on noise)
+            return max(0.005, min(0.10, value))
+        elif key == 'take_profit':
+            # Hard Limit: 1% to 50%
+            return max(0.01, min(0.50, value))
+        elif key == 'leverage_cap':
+            return max(1.0, min(5.0, value))
+        elif key == 'sat_rvol':
+            # Soft Limit: Tanh compression for > 5.0
+            if value > 5.0:
+                return 5.0 + math.tanh(value - 5.0) * 5.0 # Maxes around 10
+            return max(1.0, value)
+        elif key == 'trailing_activation':
+            # Hard Limit: 5% to 200% activation
+            return max(0.05, min(2.0, value))
+        elif key == 'trailing_distance':
+            # Hard Limit: 0.5% to 10% distance
+            return max(0.005, min(0.10, value))
+        else:
+            return value
 
 
 
@@ -95,228 +133,194 @@ class EvolutionLab:
                 self.population[0] = elite
 
     def run_gauntlet(self, genome: Dict, basket: List[str] = None) -> Dict:
-        """Run the Gauntlet: Compounds capital across asset basket."""
-        # Use provided basket or full symbol list
+        """
+        Run the Gauntlet: Calculates average performance across the asset basket.
+        Logic: Portfolio-wide Reliability (Parallel Evaluation)
+        """
         active_symbols = basket if basket else self.symbols
         
-        current_capital = self.initial_capital
+        # Aggregate Stats
+        total_roi = 0.0
+        total_sharpe = 0.0
+        total_sortino = 0.0
+        total_max_dd = 0.0
         total_trades = 0
-        wins = 0
+        total_wins = 0
         
-        # Track global drawdown across the sequence
-        max_dd = 0.0
-        peak_equity = self.initial_capital
-
-        peak_equity = self.initial_capital
+        valid_arenas = 0
         
-        # Shuffle symbols to test portfolio robustness (Sequence Risk)
-        # Note: If basket is passed, we assume order matters? No, usually random is better.
-        test_sequence = active_symbols.copy()
-        # random.shuffle(test_sequence) # Optional: Enable for sequence testing
-
-        for symbol in test_sequence:
-            # Safety check: if symbol not in datasets
+        # Test each asset independently (Fixed Capital per Asset)
+        test_capital = 1000.0 
+        
+        for symbol in active_symbols:
             if symbol not in self.datasets: continue
             
-            arena = self.datasets[symbol]
+            arena = copy.copy(self.datasets[symbol])
+            if arena.df is None or arena.df.empty: continue
             
-            # Skip empty arenas (e.g. data load failed)
-            if arena.df is None or arena.df.empty:
-                # logger.warning(f"Skipping {symbol} (No Data)")
-                continue
-                
-            arena.capital = current_capital
+            # Split Data: 70% Train, 30% Val
+            full_df = arena.df
+            split_idx = int(len(full_df) * 0.7)
+            
+            # --- PHASE A: TRAIN ---
+            arena.df = full_df.iloc[:split_idx]
+            arena.capital = test_capital
             arena.inventory = 0.0
-            arena.entry_price = 0.0
+            arena.margin_locked = 0.0
             arena.trades = []
             arena.equity_curve = []
             
-            # FORCE LEVERAGE from GENOME (1.0x)
+            # Inject Genome
             arena.leverage = genome.get('leverage_cap', 1.0)
-            
             arena.inject_strategy(EvoStrategy(genome))
-            
             arena.run()
             
-            current_capital = arena.capital
+            # Capture Metrics (Train)
+            train_roi = (arena.capital - test_capital) / test_capital
             
-            # Harvest Stats
-            # Harvest Stats
-            trades = [t for t in arena.trades if t['type']=='SELL']
-            total_trades += len(trades)
-            wins += len([t for t in trades if t['pnl']>0])
+            # --- PHASE B: VALIDATION (Out-of-Sample) ---
+            arena.df = full_df.iloc[split_idx:]
+            arena.capital = test_capital # Reset capital for validation
+            arena.inventory = 0.0
+            arena.margin_locked = 0.0
+            arena.trades = []
+            arena.equity_curve = []
             
-            # === WALK-FORWARD VALIDATION (Time Travel) ===
-            # Split Data: 80% Train (Past) | 20% Test (Future)
-            # We enforce that the strategy must perform in the Test set.
-            total_candles = len(arena.df)
-            split_idx = int(total_candles * 0.8)
-            if split_idx < len(arena.df):
-                split_ts = arena.df.iloc[split_idx]['timestamp']
+            arena.run()
+            val_roi = (arena.capital - test_capital) / test_capital
+            
+            # Restore full DF
+            arena.df = full_df
+            
+            # Capture Metrics for this Asset (Focus on Validation for Fitness)
+            if arena.trades:
+                valid_arenas += 1
                 
-                # Split Equity Curve
-                train_curve = [e for e in arena.equity_curve if e['timestamp'] < split_ts]
-                test_curve = [e for e in arena.equity_curve if e['timestamp'] >= split_ts]
+                # --- DATA GLITCH GUARD (Advanced) ---
+                is_valid, reason = self.guard.validate_roi(symbol, val_roi)
+                if not is_valid:
+                    logger.warning(f"🛡️ DATA GUARD: Ignoring {symbol} Glitch ROI {val_roi*100:.1f}%. Reason: {reason}")
+                    valid_arenas -= 1 # Revert count
+                    continue # Skip adding this toxic asset to the average
+                # -------------------------
                 
-                # Analyze Test Performance
-                if test_curve:
-                    start_test = train_curve[-1]['equity'] if train_curve else self.initial_capital
-                    end_test = test_curve[-1]['equity']
-                    test_roi = (end_test - start_test) / start_test if start_test > 0 else 0
-                    
-                    # Count Test Phase Trades (Consistency Check)
-                    test_trades_count = len([t for t in arena.trades if t['time'] >= split_ts and t['type'] == 'SELL'])
-
-                    # Test Drawdown
-                    test_peak = start_test
-                    test_max_dd = 0.0
-                    for item in test_curve:
-                        if item['equity'] > test_peak: test_peak = item['equity']
-                        dd = (test_peak - item['equity']) / test_peak
-                        if dd > test_max_dd: test_max_dd = dd
-                        
-                    # TEST SCORE: Survival * ROI
-                    test_survival = 1.0 - (test_max_dd ** 2)
-                    
-                    # CONSISTENCY GATE:
-                    # If 0 trades in Test Phase, Fitness = 0 (Dormant Strategy)
-                    if test_trades_count == 0:
-                         test_multiplier = 0.0 # FAIL: Did not trade in future
-                    elif test_roi < 0:
-                        test_multiplier = 0.1 # FAIL: Lost money in future
-                    else:
-                        test_multiplier = 1.0 + test_roi # PASS: Profited in future
-                else:
-                    test_multiplier = 1.0 # No test data (short run)
-            else:
-                 test_multiplier = 1.0
-            
-            # Update Global Drawdown Tracking (Standard)
-            if arena.equity_curve:
+                total_roi += val_roi
+                
+                # 2. Trades & Wins
+                curr_trades = [t for t in arena.trades if t['type']=='SELL']
+                total_trades += len(curr_trades)
+                total_wins += len([t for t in curr_trades if t['pnl']>0])
+                
+                # 3. Drawdown (Local)
+                peak = test_capital
+                local_max_dd = 0.0
                 for item in arena.equity_curve:
-                    eq = item['equity']
-                    if eq > peak_equity: 
-                        peak_equity = eq
+                    if item['equity'] > peak: peak = item['equity']
+                    dd = (peak - item['equity']) / peak
+                    if dd > local_max_dd: local_max_dd = dd
+                total_max_dd += local_max_dd
+                
+                # 4. Sharpe/Sortino (Local)
+                import numpy as np
+                if len(arena.equity_curve) > 2:
+                    eq_series = [e['equity'] for e in arena.equity_curve]
+                    returns = np.diff(eq_series) / eq_series[:-1]
+                    returns = returns[returns != 0]
                     
-                    # Calculate DD from global peak
-                    dd = (peak_equity - eq) / peak_equity
-                    if dd > max_dd: 
-                        max_dd = dd
+                    if len(returns) > 5:
+                        avg_ret = np.mean(returns)
+                        std_dev = np.std(returns) + 1e-9
+                        
+                        # Annualize (Approx 15m/1h candles)
+                        s_sharpe = min(avg_ret / std_dev, 5.0) # Cap at 5.0
+                        
+                        total_sharpe += s_sharpe
+                        
+                        # Calmar Ratio (Return / Max DD)
+                        calmar = val_roi / max(local_max_dd, 0.01)
+                        total_sortino += min(calmar, 10.0) # Using sortino slot for Calmar
             
-            # Bankruptcy check
-            if current_capital < 2.0:
-                current_capital = 0
-                max_dd = 1.0 # bankrupt
-                test_multiplier = 0.0 # Failed
-                break
-                
-        roi = (current_capital - self.initial_capital) / self.initial_capital
-        win_rate = wins / total_trades if total_trades > 0 else 0
-        
-        # --- ADVANCED FITNESS FUNCTION (Risk-Adjusted) ---
-        # Objective: Reward consistency, Penalize volatility and deep drawdowns.
-        # Fitness = Sortino * Calmar * (1 - non_linear_dd_penalty)
-        
-        import numpy as np
-        
-        fitness = 0.0
-        
-        if arena.equity_curve and len(arena.equity_curve) > 2:
-            # 1. Calculate Returns Series
-            eq_series = [e['equity'] for e in arena.equity_curve]
-            returns = np.diff(eq_series) / eq_series[:-1]
-            returns = returns[returns != 0] # Filter idle
-            
-            if len(returns) > 5:
-                # 2. Risk Metrics
-                avg_ret = np.mean(returns)
-                std_dev = np.std(returns)
-                downside_returns = returns[returns < 0]
-                downside_std = np.std(downside_returns) if len(downside_returns) > 0 else std_dev
-                
-                # Annualized (Assuming 15m/1H candles? - Heuristic approx)
-                # Volatility Adjustment
-                
-                # Sharpe / Sortino Calculation (Safe)
-                # Annualized (Assuming 15m/1H candles? - Heuristic approx)
-                
-                std_dev_safe = std_dev if std_dev > 1e-9 else 1e-9
-                downside_std_safe = downside_std if downside_std > 1e-9 else 1e-9
-                
-                sharpe = avg_ret / std_dev_safe
-                sortino = avg_ret / downside_std_safe
-                
-                # CAP EXTREME VALUES (Heal the math)
-                sortino = min(sortino, 50.0) 
-                sharpe = min(sharpe, 20.0)
-
-                # 3. Drawdown Penalty (Non-Linear)
-                # DD < 20% -> Linear Penalty
-                # DD > 20% -> Exponential Penalty (The "Death Zone")
-                # DD > 50% -> Fitness Obliteration
-                
-                dd_penalty = 0.0
-                if max_dd <= 0.20:
-                    dd_penalty = max_dd * 1.5
-                elif max_dd <= 0.50:
-                    dd_penalty = 0.30 + ((max_dd - 0.20) * 3.0) # 20-50% scales fast
-                else:
-                    dd_penalty = 1.0 # >50% DD is instant failure for institutional grade
-                    
-                survival_score = 1.0 - dd_penalty
-                if survival_score < 0: survival_score = 0
-                
-                # 4. Profit Factor (Gross Win / Gross Loss)
-                # Add check for zero loss
-                gross_win = sum([t['pnl'] for t in trades if t['pnl'] > 0])
-                gross_loss = abs(sum([t['pnl'] for t in trades if t['pnl'] < 0]))
-                profit_factor = (gross_win / gross_loss) if gross_loss > 0 else 1.0
-                profit_factor = min(profit_factor, 10.0) # Cap extreme profit factors
-                
-                # 5. Composite Score
-                # Weighted mix of Stability (Sortino), Profitability (Profit Factor), and Survival
-                
-                # Base: ROI damped by Time
-                # We want ROI, but not at the cost of logic.
-                
-                # New Fitness Formula:
-                # Fit = (Sortino^2) * Log(Total_Return) * Survival_Score
-                
-                log_ret = np.log1p(max(0, roi)) # Log return to dampen millions%
-                
-                fitness = (sortino * 2.0) + (profit_factor * 1.0) + (log_ret * 5.0)
-                fitness *= survival_score
-                
-                # Final hard clamp for bankruptcy
-                if max_dd > 0.60: fitness = 0.0
-                
-            else:
-                fitness = 0.0 # Not enough trading activity
+        # === AVERAGE METRICS ===
+        if valid_arenas > 0:
+            avg_roi = total_roi / valid_arenas
+            avg_sharpe = total_sharpe / valid_arenas
+            avg_sortino = total_sortino / valid_arenas
+            avg_dd = total_max_dd / valid_arenas
+            win_rate = total_wins / total_trades if total_trades > 0 else 0
         else:
-            fitness = 0.0
+            return {
+                'genome': genome, 'fitness': 0.0, 'roi': 0.0, 'max_dd': 1.0, 
+                'final_equity': self.initial_capital, 'sharpe':0,'sortino':0, 'trades':0
+            }
+            
+        # === FITNESS FUNCTION (Multi-Objective) ===
+        # Prioritize Risk-Adjusted Returns > Raw ROI
+        
+        # 1. Survival Factor (Heavy Penalty for DD)
+        survival_score = 1.0
+        if avg_dd > 0.15: survival_score -= (avg_dd - 0.15) * 2.0 # Linear penalty start
+        if avg_dd > 0.30: survival_score = 0.1 # Death Zone
+        
+        # 2. Activity Check (Avoid dead strategies)
+        if total_trades < (valid_arenas * 2): # Min 2 trades per asset avg
+            survival_score *= 0.5
+            
+        # 3. Core Score: Sharpe + Sortino + ROI
+        # Weighting: Reliability (60%), Growth (40%)
+        # CLAMPING: Prevent Sharpe/Sortino inflation
+        c_sharpe = min(avg_sharpe, 3.0) 
+        c_sortino = min(avg_sortino, 5.0)
+        
+        raw_score = (c_sharpe * 2.0) + (c_sortino * 1.0) + (avg_roi * 10.0)
+        
+        # 4. Quadratic Drawdown Penalty (RECALIBRATION)
+        # 10% DD = 1 / (1 + (1)^2) = 0.5x
+        # 20% DD = 1 / (1 + (2)^2) = 0.2x
+        # 40% DD = 1 / (1 + (4)^2) = 0.05x (Hard Penalty)
+        dd_penalty = 1.0 / (1.0 + (avg_dd * 10.0)**2)
+        
+        # 5. Overfit Penalty: If Train ROI is 2x Val ROI
+        # overfit_penalty = max(0, (train_roi - val_roi) * 2.0)
+        
+        # 6. Diversity Bonus: Must trade >= 3 assets if portfolio testing
+        diversity_bonus = 1.0
+        if len(active_symbols) >= 3 and valid_arenas < 3:
+            diversity_bonus = 0.5 # Concentration Risk
+            
+        fitness = max(0.0, raw_score * survival_score * dd_penalty * diversity_bonus)
+        
+        # Fake Equity for Log readability (Projected)
+        projected_equity = self.initial_capital * (1 + avg_roi)
 
-        # Test Multiplier (Future Validation)
-        fitness *= test_multiplier
-        
-        # Dead strategy penalty
-        if total_trades == 0: fitness = 0.0
-        
+        # === SANITY CHECK: Physics Violation ===
+        # If Fitness is super-human (> 1000), it's likely a data glitch (bad tick).
+        # Normal fitness is 10-100.
+        if fitness > 1000.0:
+            # logger.warning(f"⚠️ PHYSICS VIOLATION: Discarding Glitch Genome (Fit {fitness:.2f}, ROI {avg_roi*100:.1f}%)")
+            return {
+                'genome': genome,
+                'fitness': 0.001, # Nuke it
+                'roi': 0.0,
+                'final_equity': self.initial_capital,
+                'trades': 0, 'win_rate': 0, 'max_dd': 1.0, 'sharpe': 0, 'sortino': 0,
+                'test_score': 0.0,
+                'violation': True
+            }
+
         return {
             'genome': genome,
-            'final_equity': current_capital,
-            'roi': roi,
+            'final_equity': projected_equity, # For log display only
+            'roi': avg_roi,
             'win_rate': win_rate,
             'trades': total_trades,
-            'max_dd': max_dd,
-            'sharpe': sharpe if 'sharpe' in locals() else 0.0,
-            'sortino': sortino if 'sortino' in locals() else 0.0,
-            'validation_roi': test_roi if 'test_roi' in locals() else 0.0,
-            'validation_trades': test_trades_count if 'test_trades_count' in locals() else 0,
-            'entropy': 0.0,
-            'test_score': test_multiplier, 
+            'max_dd': avg_dd,
+            'sharpe': avg_sharpe,
+            'sortino': avg_sortino,
             'fitness': fitness,
-            'sharpe': float(sharpe) if 'sharpe' in locals() else 0.0,
-            'sortino': float(sortino) if 'sortino' in locals() else 0.0
+            'validation_roi': 0.0, # Removed WF for speed/simplicity in V2
+            'validation_trades': 0,
+            'test_score': 1.0,
+            'violation': False
         }
 
     def evolve(self, generations: int = 5, mutation_rate: float = 0.1, population_size: int = None, basket: List[str] = None) -> Dict:
@@ -327,44 +331,103 @@ class EvolutionLab:
         target_pop_size = population_size if population_size else self.population_size
         basket_tag = "Full Market" if not basket else f"Basket({len(basket)})"
         
+        # --- SANITY CHECK: Purge Glitched Champions ---
+        if self.best_overall:
+            # Re-run the gauntlet on the current champion to confirm its score with NEW logic
+            # This kills 'Ghost' champions from previous buggy versions (e.g., Million Dollar Glitch)
+            confirmed_stats = self.run_gauntlet(self.best_overall['genome'], basket=basket)
+            
+            # If the confirmed score is significantly worse, replace it
+            if confirmed_stats['fitness'] < self.best_overall['fitness'] * 0.5:
+                # logger.warning(f"📉 Downgrading Glitched Champion: Fit {self.best_overall['fitness']:.2f} -> {confirmed_stats['fitness']:.2f}")
+                self.best_overall = confirmed_stats
+        # ----------------------------------------------
+        
         logger.info(f"🏹 Starting Evolution: {generations} Gens, {target_pop_size} Pop, {basket_tag}")
+        
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         
         for gen in range(generations):
             results = []
-            for genome in self.population:
-                res = self.run_gauntlet(genome, basket=basket)
-                results.append(res)
+            violation_count = 0
+            
+            # --- PARALLEL GAUNTLET ---
+            with ThreadPoolExecutor(max_workers=min(os.cpu_count(), 8)) as executor:
+                future_to_genome = {executor.submit(self.run_gauntlet, g, basket=basket): g for g in self.population}
                 
+                for future in as_completed(future_to_genome):
+                    try:
+                        res = future.result()
+                        results.append(res)
+                        if res.get('violation', False):
+                            violation_count += 1
+                    except Exception as e:
+                        logger.error(f"Genome evaluation failed: {e}")
+            # ------------------------
+            
+            # --- EARLY STOPPING: Physics Violation Check ---
+            violation_rate = violation_count / len(self.population)
+            if violation_rate > 0.05:
+                logger.warning(f"☢️ CRITICAL FAILURE: {violation_rate*100:.1f}% of population violated physics constraints. Triggering EMERGENCY RESET.")
+                # Nuke population and restart with valid seeds
+                self.seed_population()
+                return self.evolve(generations=generations, mutation_rate=mutation_rate, population_size=population_size, basket=basket)
+            # -----------------------------------------------
+
             results.sort(key=lambda x: x['fitness'], reverse=True)
             best_gen = results[0]
             
             # --- MEMORY: Update Hall of Fame ---
-            # Keep top 10 unique genomes
-            # Logic: If fits > worst_hof, add. Then dedup.
+            # Keep top 10 unique genomes (Deduplication Logic)
+            
+            # 1. Add potential candidate
             self.hall_of_fame.append(best_gen)
-            # Sort HOF
+            
+            # 2. Sort by Fitness
             self.hall_of_fame.sort(key=lambda x: x['fitness'], reverse=True)
-            # Keep Top 10
-            self.hall_of_fame = self.hall_of_fame[:10]
+            
+            # 3. Deduplicate (JSON string based uniqueness)
+            unique_hof = []
+            seen_genomes = set()
+            
+            for entry in self.hall_of_fame:
+                # Create hashable signature (sorted keys)
+                g_sig = json.dumps(entry['genome'], sort_keys=True)
+                if g_sig not in seen_genomes:
+                    unique_hof.append(entry)
+                    seen_genomes.add(g_sig)
+            
+            # 4. Truncate to Top 10
+            self.hall_of_fame = unique_hof[:10]
             # -----------------------------------
             
-            logger.info(f"Gen {gen+1} Leader: Fit {best_gen['fitness']:.2f} | Eq ${best_gen['final_equity']:.2f} (DD {best_gen['max_dd']*100:.1f}%) | Sharpe {best_gen.get('sharpe', 0):.2f} | Sortino {best_gen.get('sortino', 0):.2f}")
+            # === DIVERSITY CHECK ===
+            # Calculate variance of a key gene (e.g., rsi_buy) to detect homogeneity
+            rsi_values = [g['genome']['rsi_buy'] for g in results]
+            pop_variance = np.var(rsi_values) if rsi_values else 0
+            
+            logger.info(f"Gen {gen+1} Leader: Fit {best_gen['fitness']:.2f} | Eq ${best_gen['final_equity']:.2f} (DD {best_gen['max_dd']*100:.1f}%) | Sharpe {best_gen.get('sharpe', 0):.2f} | Div {pop_variance:.1f}")
             
             if self.best_overall is None or best_gen['fitness'] > self.best_overall['fitness']:
                 self.best_overall = best_gen
                 
-            # === PARETO REPRODUCTION (80/20 Rule) ===
-            # Only the Vital Few (Top 20%) reproduce.
-            # The Trivial Many (Bottom 80%) are discarded.
-            # === PARETO REPRODUCTION (80/20 Rule) ===
-            # Only the Vital Few (Top 20%) reproduce.
-            # The Trivial Many (Bottom 80%) are discarded.
-            elite_count = max(2, int(target_pop_size * 0.20)) # Min 2
+            # === PARETO RELOADED ===
+            # Detect Stagnation
+            is_stagnant = best_gen['fitness'] < 0.0001
+            
+            if is_stagnant:
+                logger.warning(f"⚠️ EVOLUTION STALLED (Fit=0). Triggering MASS EXTINCTION event.")
+                # Keep top 2 just in case, but flood the rest with Aliens
+                elite_count = 2
+                alien_count = target_pop_size - elite_count
+            else:
+                elite_count = max(2, int(target_pop_size * 0.20)) # Top 20%
+                alien_count = int(target_pop_size * 0.20) # 20% Aliens
+
             survivors = results[:elite_count] 
             new_pop = [s['genome'] for s in survivors]
             
-            # 1. 🛸 ALIENS (20% Fresh Random) - Escape Local Optima
-            alien_count = int(target_pop_size * 0.2)
+            # 1. 🛸 ALIENS - Escape Local Optima
             for _ in range(alien_count):
                 new_pop.append(self.generate_random_genome())
                 
@@ -390,27 +453,21 @@ class EvolutionLab:
                 for _ in range(mutation_intensity):
                     key = random.choice(list(child.keys()))
                     if not isinstance(child[key], bool):
-                        # Wider variance: 0.8x to 1.2x (Scaled by rate?)
-                        # Let's keep variance standard but frequency dynamic
-                        child[key] *= random.uniform(0.8, 1.2)
+                        current_val = child[key]
                         
-                        # --- SAFETY CLAMPING ---
-                        # Enforce Physics: Stop Loss * Leverage < 1.0 (ideally < 0.8 for buffer)
-                        if key == 'stop_loss':
-                            lev = child.get('leverage_cap', self.leverage)
-                            max_safe_sl = 0.8 / lev if lev > 0 else 1.0
-                            if child['stop_loss'] > max_safe_sl:
-                                child['stop_loss'] = max_safe_sl
-                        # Safety Clamp: Leverage Cap
-                        if key == 'leverage_cap':
-                            child['leverage_cap'] = max(1.0, min(child['leverage_cap'], 5.0)) # Clamp 1x-5x
-
-                        # Safety Clamp: Stop Loss vs Leverage
-                        if key == 'rsi_buy':
-                            child['rsi_buy'] = max(10, min(60, child['rsi_buy'])) # 10 < Buy < 60
-                        if key == 'rsi_sell':
-                            child['rsi_sell'] = max(40, min(95, child['rsi_sell'])) # 40 < Sell < 95
+                        # Mutation Algo: Tanh Drift vs Proportional
+                        # 50% chance of 'Nudge' (0.8-1.2x), 50% chance of 'Drift' (+/- small amount)
+                        if random.random() > 0.5:
+                            # Proportional Nudge
+                            child[key] *= random.uniform(0.8, 1.2)
+                        else:
+                            # Drift (good for zero-bound values)
+                            drift = random.uniform(-0.1, 0.1) * current_val
+                            child[key] += drift
                             
+                        # CRITICAL: Normalize
+                        child[key] = self.normalize_gene(key, child[key])
+
                 new_pop.append(child)
                 
             self.population = new_pop

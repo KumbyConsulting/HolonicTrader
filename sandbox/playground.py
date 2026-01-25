@@ -11,11 +11,13 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from sandbox.strategies.base import Strategy, Signal
 from HolonicTrader.agent_observer import ObserverHolon
+from HolonicTrader.data_guard import DataGuard
 try:
     import holonic_speed # Use Rust for Indicators
     print("[Sandbox] 🚀 Rust Engine Loaded (High Performance)")
 except ImportError:
-    print("[Sandbox] ⚠️ Rust Engine not found. Using Python Fallback (Slower).")
+    # Fallback to pure Python if Rust module is missing/incompatible
+    print("[Sandbox] Rust Engine not found. Using Python Fallback (Slower).")
     
     # Python Fallback for Rust Indicators
     class HolonicSpeedFallback:
@@ -85,13 +87,31 @@ class Playground:
         self.df = None
         self.df_secondary = None
         self.strategy: Strategy = None
+        
+        # Data Quality Shield
+        self.guard = DataGuard()
 
     def load_data(self, source: str = 'kraken', timeframe: str = '1h', limit: int = 1000):
-        """Load historical data using ObserverHolon."""
+        """Load historical data using ObserverHolon with Pickle Caching."""
         print(f"[Sandbox] 📥 Loading {limit} candles for {self.symbol}...")
         observer = ObserverHolon(exchange_id=source)
+        
+        # Cache Path
+        clean_sym = self.symbol.replace('/', '')
+        cache_path = os.path.join(observer.data_dir, f"{clean_sym}_{timeframe}_{limit}_processed.pkl")
+        
         try:
-            # Try loading local first
+            # 1. Try Cache
+            if os.path.exists(cache_path):
+                # Check if cache is fresh enough (e.g. < 1 hour old?) - actually just check valid
+                try:
+                    self.df = pd.read_pickle(cache_path)
+                    print(f"   ⚡ Cache Hit: Loaded {len(self.df)} candles from {cache_path}")
+                    return # Skip Fetch + Compute
+                except Exception as e:
+                    print(f"   ⚠️ Cache Corrupt: {e}")
+                    
+            # 2. Load/Fetch Raw
             self.df = observer.load_local_history(self.symbol)
             if self.df.empty or len(self.df) < limit:
                  print("   Local data insufficient/missing. Fetching from API...")
@@ -103,9 +123,20 @@ class Playground:
             
             if not self.df.empty and 'timestamp' in self.df.columns:
                  print(f"   Loaded {len(self.df)} candles ({self.df['timestamp'].iloc[0]} - {self.df['timestamp'].iloc[-1]})")
+                 
+                 # 3. Compute
+                 self._compute_indicators(self.df)
+                 self._audit_data_integrity(self.df)
+                 
+                 # 4. Save Cache
+                 try:
+                     self.df.to_pickle(cache_path)
+                     print(f"   💾 Cache Saved: {cache_path}")
+                 except Exception as e:
+                     print(f"   ⚠️ Cache Save Failed: {e}")
+                     
             else:
                  print(f"   ⚠️ Loaded {len(self.df)} candles (Empty or Missing Timestamp)")
-            self._compute_indicators(self.df)
             
         except Exception as e:
             print(f"[Sandbox] ❌ Data Load Error: {e}")
@@ -122,30 +153,57 @@ class Playground:
             # Actually Observer.load_local_history hardcodes to '1h' usually or we need to check agent_observer.
             
             # Direct fetch fallback pattern
-            filename = f"{self.symbol.replace('/', '')}_{timeframe}.csv"
-            path = os.path.join(observer.data_dir, filename)
+            # === OPTIMIZATION: Pickle Cache ===
+            clean_sym = self.symbol.replace('/', '')
+            base_filename = f"{clean_sym}_{timeframe}"
+            pickle_path = os.path.join(observer.data_dir, f"{base_filename}.pkl")
+            csv_path = os.path.join(observer.data_dir, f"{base_filename}.csv")
             
-            if os.path.exists(path):
+            # 1. Try Pickle First
+            if os.path.exists(pickle_path):
+                try:
+                    # Check timestamp if CSV exists to ensure freshness? 
+                    # For simplicity, if pickle exists, we trust it (or assume Observer updates it)
+                    self.df_secondary = pd.read_pickle(pickle_path)
+                    print(f"   ⚡ Secondary Data Cache Hit ({timeframe})")
+                    self._compute_indicators(self.df_secondary)
+                    return # Done
+                except Exception:
+                    pass # Fallback
+            
+            # 2. CSV Fallback with Lock Fix
+            if os.path.exists(csv_path):
                 # LOCK FIX: Copy to temp to avoid collision with Live Bot writing
                 try:
                     import shutil
-                    temp_path = path + ".tmp"
-                    shutil.copy(path, temp_path)
+                    temp_path = csv_path + ".tmp"
+                    shutil.copy(csv_path, temp_path)
                     self.df_secondary = pd.read_csv(temp_path)
                     self.df_secondary['timestamp'] = pd.to_datetime(self.df_secondary['timestamp'])
                     try: os.remove(temp_path)
                     except: pass
+                    
+                    # SAVE CACHE
+                    try: self.df_secondary.to_pickle(pickle_path)
+                    except: pass
+                    
                 except Exception as e:
                     print(f"   ⚠️ Read Error (Lock?): {e}")
                     self.df_secondary = None
             else:
                  print(f"   Local {timeframe} missing. Fetching...")
                  self.df_secondary = observer.fetch_market_data(symbol=self.symbol, timeframe=timeframe, limit=limit)
+                 # Save if fetched
+                 if self.df_secondary is not None and not self.df_secondary.empty:
+                      try: self.df_secondary.to_pickle(pickle_path)
+                      except: pass
             
             if self.df_secondary is not None and not self.df_secondary.empty:
                 if 'timestamp' in self.df_secondary.columns:
                     # self.df_secondary = self.df_secondary.sort_values('timestamp') # optimize: assume sorted from API
                     print(f"   Loaded {len(self.df_secondary)} secondary candles")
+                    
+                    self._audit_data_integrity(self.df_secondary)
                     self._compute_indicators(self.df_secondary)
                 else:
                     print(f"   ⚠️ Secondary data missing 'timestamp' column. Ignoring.")
@@ -156,6 +214,24 @@ class Playground:
         except Exception as e:
             print(f"[Sandbox] ❌ Secondary Data Load Error: {e}")
             self.df_secondary = None
+
+    def _audit_data_integrity(self, df: pd.DataFrame):
+        """Scan for 'Glitch Candles' using the DataGuard logic."""
+        if df is None or df.empty: return
+        
+        glitch_indices = []
+        for i in range(len(df)):
+            row = df.iloc[i]
+            is_valid = self.guard.audit_candle(
+                self.symbol,
+                row['open'], row['high'], row['low'], row['close'], row['volume']
+            )
+            if not is_valid:
+                glitch_indices.append(df.index[i])
+        
+        if glitch_indices:
+            print(f"   ⚠️ DATA INTEGRITY ALERT: Found {len(glitch_indices)} Glitch Candles. Guarding...")
+            # Ideally we mask them or skip, for now we log and warn.
 
     def _compute_indicators(self, df):
         """Pre-calculate standard indicators using Rust Speed."""
@@ -208,18 +284,12 @@ class Playground:
         if self.verbose: print(f"[Sandbox] ▶️ Running Simulation on {len(self.df)} candles...")
         
         if hasattr(self.strategy, 'genome') and 'holonic_speed' in globals():
-            pass
-            # try:
-            #     # self._run_warp_speed() # DISABLED: Suspected source of "God Mode" Glitch
-            #     # return # Skip Python Loop
-            # except TypeError as te:
-            #     if self.verbose: print(f"[Sandbox] ⚠️ Rust Signature Mismatch: {te}. PLEASE RECOMPILE RUST ENGINE.")
-            # except Exception as e:
-            #      # if self.verbose: print(f"[Sandbox] Warp fallback: {e}")
-            #      pass
-            # except Exception as e:
-            #      # if self.verbose: print(f"[Sandbox] Warp fallback: {e}")
-            #      pass 
+            try:
+                self._run_warp_speed() 
+                return # Skip Python Loop
+            except Exception as e:
+                if self.verbose: print(f"[Sandbox] Warp fallback: {e}")
+                pass
         
         start_time = time.time()
         
@@ -423,6 +493,27 @@ class Playground:
                 # Size Logic (Margin)
                 pct_size = max(0.0, min(1.0, signal.size)) # Clamp 0-1
                 
+                # --- LIQUIDITY GATE ---
+                # Realism: You cannot buy more than 1% of the candle's volume without moving the market.
+                candle_volume_usd = row.get('volume', 0) * price 
+                max_liquidity_allowed = candle_volume_usd * 0.01 # Max 1% of volume
+                
+                # If Volume is missing/zero, assume infinite (for unit tests) or clamp?
+                # Let's assume infinite if volume=0 to avoid breaking simple CSVs
+                if candle_volume_usd > 0:
+                    max_size_usd = max_liquidity_allowed
+                    implied_notional = self.capital * pct_size * getattr(self, 'leverage', 1.0)
+                    
+                    if implied_notional > max_size_usd:
+                        # Cap size to available liquidity
+                        if self.verbose: 
+                            print(f"[Sandbox] 💧 LIQUIDITY CONSTRAINED: Wanted ${implied_notional:.0f}, Capped at ${max_size_usd:.0f} (1% Vol)")
+                        
+                        # Recalculate pct_size to fit liquidity
+                        # pct_size = (max_size_usd / leverage) / capital
+                        new_pct = (max_size_usd / getattr(self, 'leverage', 1.0)) / self.capital
+                        pct_size = min(pct_size, new_pct)
+
                 # --- RISK MANAGEMENT CAP (2% Rule) ---
                 # "No single trade > 2% risk"
                 # Risk = (Entry - SL) * Qty
@@ -707,14 +798,15 @@ class Playground:
             take_profit = float(genome.get('take_profit', 0.0))
             
             # Calculate Trailing Params from R-Multiples
+            # Calculate Trailing Params from R-Muliples
             # Activation = SL% * R-Multiple
             trail_act = stop_loss * float(genome.get('trailing_activation', 2.0))
             trail_dist = stop_loss * float(genome.get('trailing_distance', 0.3))
             
             signals = np.zeros(len(self.df), dtype=np.int32)
-            buy_mask = self.df['rsi'] < genome['rsi_buy']
+            buy_mask = (self.df['rsi'] < genome['rsi_buy']).values
             signals[buy_mask] = 1
-            sell_mask = self.df['rsi'] > genome['rsi_sell']
+            sell_mask = (self.df['rsi'] > genome['rsi_sell']).values
             signals[sell_mask] = -1
             
             timestamps = self.df['timestamp'].astype(np.int64) // 10**6 

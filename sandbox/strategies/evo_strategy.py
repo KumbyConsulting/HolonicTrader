@@ -24,6 +24,13 @@ class EvoStrategy(Strategy):
         self.sat_rvol = genome.get('sat_rvol', 1.2)
         self.sat_bb_expand = genome.get('sat_bb_expand', 0.0)
 
+        # Trailing Stop Genes
+        self.trailing_activation = genome.get('trailing_activation', 0.5) # Activation R-multiple
+        self.trailing_distance = genome.get('trailing_distance', 0.02)    # Distance from peak
+        
+        self.peak_price = 0.0
+        self.trail_active = False
+
     def on_candle(self, slice_df, indicators, portfolio_state, secondary_slice_df=None) -> Signal:
         inventory = portfolio_state['inventory']
         price = indicators['price']
@@ -41,11 +48,33 @@ class EvoStrategy(Strategy):
             if price > avg_entry * (1 + self.take_profit):
                 return Signal('SELL', reason="Take Profit (Gene)")
             
+            # --- TRAILING STOP LOGIC (SYNC WITH RUST) ---
+            # 1. Activation
+            activation_price = avg_entry * (1 + (self.stop_loss * self.trailing_activation))
+            if not self.trail_active and price >= activation_price:
+                self.trail_active = True
+                self.peak_price = price
+            
+            # 2. Tracking
+            if self.trail_active:
+                if price > self.peak_price:
+                    self.peak_price = price
+                
+                trail_stop_price = self.peak_price * (1 - self.trailing_distance)
+                if price <= trail_stop_price:
+                    return Signal('SELL', reason="Trailing Stop (Gene)")
+            # --------------------------------------------
+
             # Indicator Exit
             if rsi > self.rsi_sell:
+                self.trail_active = False # Reset for next
                 return Signal('SELL', reason="RSI Overbought")
                 
             return Signal('HOLD')
+        else:
+            # Entry / Reset
+            self.peak_price = 0.0
+            self.trail_active = False
 
         # ENTRY LOGIC
         if inventory == 0:

@@ -92,12 +92,19 @@ class PPOHolon(Holon):
         
         # High-Performance OpenVINO Inference
         if self.ov_actor:
-             # state_tensor is already (1, 6)
-             mu = float(self.ov_actor(state_tensor)[0][0][0])
+             # state_tensor is (1, state_size)
+             out = self.ov_actor(state_tensor)
+             # Handle multiple possible OpenVINO output formats
+             if isinstance(out, dict):
+                 # Get first value from dict
+                 out = list(out.values())[0]
+             
+             # Flatten and get first element
+             mu = float(np.array(out).flatten()[0])
         else:
             s_tensor = tf.convert_to_tensor(state_tensor, dtype=tf.float32)
             mu_tensor = self.actor(s_tensor, training=False)
-            mu = float(mu_tensor.numpy()[0][0])
+            mu = float(mu_tensor.numpy().flatten()[0])
         
         if training:
             # Add Gaussian noise for exploration during training
@@ -213,17 +220,21 @@ class PPOHolon(Holon):
     def get_value(self, state: np.ndarray) -> float:
         state_tensor = np.expand_dims(state, axis=0)
         if self.ov_critic:
-            val = float(self.ov_critic(state_tensor)[0][0][0])
+            out = self.ov_critic(state_tensor)
+            if isinstance(out, dict): out = list(out.values())[0]
+            val = float(np.array(out).flatten()[0])
         else:
-            val = self.critic.predict(state_tensor, verbose=0)[0][0]
+            val = self.critic.predict(state_tensor, verbose=0).flatten()[0]
         return float(val)
     
     def get_log_prob(self, state: np.ndarray, action: float) -> float:
         state_tensor = np.expand_dims(state, axis=0)
         if self.ov_actor:
-            mu = float(self.ov_actor(state_tensor)[0][0][0])
+            out = self.ov_actor(state_tensor)
+            if isinstance(out, dict): out = list(out.values())[0]
+            mu = float(np.array(out).flatten()[0])
         else:
-            mu = self.actor.predict(state_tensor, verbose=0)[0][0]
+            mu = self.actor.predict(state_tensor, verbose=0).flatten()[0]
         sigma = 0.1
         log_prob = -0.5 * (((action - mu) / sigma)**2) - np.log(sigma * np.sqrt(2 * np.pi))
         return float(log_prob)

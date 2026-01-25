@@ -7,18 +7,18 @@ Implements:
 3. Principal Protection (Never risk the $10 base)
 """
 
-from typing import Any, Tuple, Literal
+from typing import Any, Tuple, Literal, Dict, List
 from HolonicTrader.holon_core import Holon, Disposition
 import config
 from HolonicTrader.agent_ppo import PPOHolon # Phase 22: The Monolith
 
-# Phase 46: Fix for missing DatabaseManager
 try:
-    from performance_tracker import DatabaseManager
+    from performance_tracker import DatabaseManager, get_performance_data
 except ImportError:
     # Fallback mock if not found during dev
     class DatabaseManager: 
         def get_win_rate(self): return 0.5
+    def get_performance_data(): return {'win_rate': 50.0}
 
 import datetime
 import time
@@ -59,6 +59,9 @@ class GovernorHolon(Holon):
         self.last_trade_time = {} # symbol -> timestamp
         self.last_specific_entry = {} # symbol -> price (for stacking distance)
         
+        # FIX 3: Stack Timeout Tracker (for 5-minute reduction trigger)
+        self.stack_timeout_tracker = {} # symbol -> first_blocked_timestamp
+        
         # Phase 7: Regime Controller Integration
         self.regime_controller = None  # Set by Trader after instantiation
         
@@ -70,6 +73,7 @@ class GovernorHolon(Holon):
         # Consolidation Engine State
         self.last_consolidation_time = 0.0
         self.consolidation_in_progress = False
+
         
         # Primary Budget Sync
         self.manage_iron_bank()
@@ -322,21 +326,39 @@ class GovernorHolon(Holon):
             print(f"[{self.name}] ⏳ Cooldown Active for {symbol} ({int(time.time() - last_time)}s < {config.GOVERNOR_COOLDOWN_SECONDS}s)")
             return False
             
-        # 2. Price Distance Check
+        # 2. Price Distance Check (with Timeout Reduction Trigger)
         last_entry = self.last_specific_entry.get(symbol, 0)
         if last_entry > 0 and symbol in self.positions:
             dist = abs(asset_price - last_entry) / last_entry
             if dist < config.GOVERNOR_MIN_STACK_DIST:
-                print(f"[{self.name}] 📏 Stack Too Close for {symbol} ({dist*100:.2f}% < {config.GOVERNOR_MIN_STACK_DIST*100:.2f}%)")
+                # FIX 3: Stack Timeout Tracking
+                now = time.time()
+                if symbol not in self.stack_timeout_tracker:
+                    self.stack_timeout_tracker[symbol] = now
+                    print(f"[{self.name}] 📏 Stack Too Close for {symbol}: Price ${asset_price:.2f} vs Entry ${last_entry:.2f} (Dist {dist*100:.2f}% < {config.GOVERNOR_MIN_STACK_DIST*100:.2f}%)")
+                else:
+                    elapsed = now - self.stack_timeout_tracker[symbol]
+                    timeout_seconds = getattr(config, 'STACK_TIMEOUT_SECONDS', 300)  # Default 5 min
+                    if elapsed > timeout_seconds:
+                        # TIMEOUT TRIGGERED - Recommend 50% reduction
+                        print(f"[{self.name}] ⏰ STACK TIMEOUT ({elapsed/60:.1f}min): {symbol} stuck at entry. RECOMMENDING 50% REDUCTION.")
+                        # Flag for potential auto-reduction in Trader/Executor
+                        self.positions[symbol]['needs_reduction'] = True
+                        # Reset entry basis to current price to unstick
+                        self.last_specific_entry[symbol] = asset_price
+                        self.stack_timeout_tracker.pop(symbol, None)
                 return False
-                
+            else:
+                # Price moved away - clear the timeout tracker
+                self.stack_timeout_tracker.pop(symbol, None)
+
         # 3. Solvency Gate (Fail Fast)
-        # If we don't have enough cash for a minimum bet, don't run AI.
         if self.available_balance < config.MIN_ORDER_VALUE:
              print(f"[{self.name}] 💸 INSOLVENCY GATE: Available ${self.available_balance:.2f} < Min ${config.MIN_ORDER_VALUE}")
              return False
 
         # 4. IRON BANK GATE (Capital Preservation)
+
         if config.IRON_BANK_ENABLED:
             # If Risk Budget is zero (or dust), we are at the Floor.
             # We allow reducing positions (checked in calc_position_size), but this is a pre-check.
@@ -349,7 +371,7 @@ class GovernorHolon(Holon):
 
         return True
 
-    def calc_position_size(self, symbol: str, asset_price: float, current_atr: float = None, atr_ref: float = None, conviction: float = 0.5, direction: str = 'BUY', crisis_score: float = 0.0, sentiment_score: float = 0.0, whale_confirmed: bool = False) -> Tuple[bool, float, float]:
+    def calc_position_size(self, symbol: str, asset_price: float, current_atr: float = None, atr_ref: float = None, conviction: float = 0.5, direction: str = 'BUY', crisis_score: float = 0.0, sentiment_score: float = 0.0, whale_confirmed: bool = False, market_bias: float = 0.5, metadata: Dict[str, Any] = None) -> Tuple[bool, float, float]:
         """
         Calculate position size with Phase 12 institutional risk management.
         
@@ -358,6 +380,7 @@ class GovernorHolon(Holon):
         2. Volatility Scalar (ATR-based sizing)
         4. Conviction Scalar (LSTM-based scaling)
         5. Holistic Feedback (Sentiment Hormone)
+        6. Dynamic Flotilla Sizing (Market Bias)
         
         Returns:
             (is_approved: bool, quantity: float, leverage: float)
@@ -499,7 +522,16 @@ class GovernorHolon(Holon):
                 return False, 0.0, 0.0
             
             # B. MAX POSITIONS CAP (Replaces Cluster Risk for Micro)
-            max_pos_limit = config.REGIME_PERMISSIONS.get(regime_key, {}).get('max_positions', config.MICRO_MAX_POSITIONS)
+            base_pos_limit = config.REGIME_PERMISSIONS.get(regime_key, {}).get('max_positions', config.MICRO_MAX_POSITIONS)
+            
+            # --- DYNAMIC FLOTILLA SIZING (User Request) ---
+            # Bull Market = More Slots
+            bonus_slots = 0
+            if market_bias > 0.8: bonus_slots = 4    # Euphoria (+4)
+            elif market_bias > 0.6: bonus_slots = 2  # Bullish (+2)
+            
+            max_pos_limit = base_pos_limit + bonus_slots
+            
             if len(self.positions) >= max_pos_limit:
                 # Allow existing position to continue (e.g. if we are reducing/exiting?)
                 # Actually, calc_position_size is only for ENTRIES (Long/Short).
@@ -542,25 +574,52 @@ class GovernorHolon(Holon):
 
         # --- PATCH 2: THE STACKING CAP (Stop the Martingale) ---
         # FIXED: Removed hardcoded MAX_STACKS = 3. Rely purely on Regime permissions.
+        # --- PATCH 2: DYNAMIC STACKING (Profit-Financed Risk) ---
+        # "Earn Your Stacks": Max Stacks = Base Limit + Floor(Open Profit / 1R)
         if existing_pos:
             regime_key = self.regime_controller.get_current_regime() if self.regime_controller else 'MICRO'
-            max_stacks_allowed = config.REGIME_PERMISSIONS.get(regime_key, {}).get('max_stacks', 0)
+            base_limit = config.REGIME_PERMISSIONS.get(regime_key, {}).get('max_stacks', 0)
             
-            # 🐳 WHALE OVERRIDE:
-            # If Whale Signal confirmed, increase stack limit.
-            if whale_confirmed:
-                max_stacks_allowed += 2 # Allow 2 extra stacks (e.g., 2 -> 4)
-                print(f"[{self.name}] 🐳 WHALE SIGNAL: Increasing Max Stacks {max_stacks_allowed-2}->{max_stacks_allowed} for {symbol}")
+            # 🐳 WHALE BONUS
+            if whale_confirmed: 
+                base_limit += 2
+                
+            # 💰 PROFIT BONUS
+            # Calculate 1R (Risk Unit)
+            risk_unit = max(1.0, self.balance * config.MAX_RISK_PCT)
+            
+            # Calculate Open Profit (Unrealized)
+            open_profit = 0.0
+            entry_p = existing_pos.get('entry_price', 0.0)
+            qty_held = existing_pos.get('quantity', 0.0)
+            pos_dir = existing_pos.get('direction', 'BUY')
+            
+            if entry_p > 0 and asset_price > 0:
+                if pos_dir == 'BUY':
+                    open_profit = (asset_price - entry_p) * qty_held
+                else:
+                    open_profit = (entry_p - asset_price) * qty_held
+            
+            # Bonus = Floor(Profit / 1R)
+            bonus_stacks = 0
+            if open_profit > 0:
+                bonus_stacks = int(open_profit / risk_unit)
+                
+            dynamic_limit = base_limit + bonus_stacks
+            
+            # HARD CAP (Sanity)
+            HARD_CAP = 10
+            dynamic_limit = min(dynamic_limit, HARD_CAP)
             
             current_stacks = existing_pos.get('stack_count', 1)
-            if current_stacks >= max_stacks_allowed:
-                 print(f"[{self.name}] 🛑 STACKING CAP: {current_stacks} >= {max_stacks_allowed} (Limit). Rejecting.")
+            
+            if current_stacks >= dynamic_limit:
+                 print(f"[{self.name}] 🛑 STACKING CAP: {current_stacks} >= {dynamic_limit} (Base {base_limit} + Bonus {bonus_stacks}). Profit ${open_profit:.2f} (1R=${risk_unit:.2f}). Rejecting.")
                  return False, 0.0, 0.0
-            # Use strict inequality if we want to allow exactly max? No, if we have 3, we can't add 4th.
-            # So if count >= max, block.
-            if current_stacks >= max_stacks_allowed:
-                print(f"[{self.name}] ⚠️ MAX STACKS REACHED ({current_stacks}/{max_stacks_allowed}). REJECTING ORDER.")
-                return False, 0.0, 0.0
+            else:
+                 print(f"[{self.name}] 🥞 DYNAMIC STACK APPROVED: {current_stacks+1}/{dynamic_limit} (Bonus {bonus_stacks} from ${open_profit:.2f} profit)")
+                 
+        # -------------------------------------------------------
         # -------------------------------------------------------
 
         # --- PHASE 35: IMMUNE SYSTEM CHECKS ---
@@ -731,13 +790,15 @@ class GovernorHolon(Holon):
                      base_notional = (base_notional / config.PREDATOR_LEVERAGE) * leverage # Adjust notional to new leverage
             # -----------------------------------------------
         
-            # Apply Volatility Scalar (if ATR provided)
+            # Apply Volatility/Physics Scalar
+            physics_scalar = self.calculate_sde_physics_scalar(metadata, direction=direction)
+            
             if current_atr and atr_ref:
                 vol_scalar = self.calculate_volatility_scalar(current_atr, atr_ref)
-                vol_adjusted_notional = base_notional * vol_scalar
-                print(f"[{self.name}] 📊 Volatility Scalar: {vol_scalar:.2f}x, Conviction: {conv_scalar:.2f}x")
+                vol_adjusted_notional = base_notional * vol_scalar * physics_scalar
+                print(f"[{self.name}] 📊 Volatility Scalar: {vol_scalar:.2f}x, Physics: {physics_scalar:.2f}x, Conviction: {conv_scalar:.2f}x")
             else:
-                vol_adjusted_notional = base_notional
+                vol_adjusted_notional = base_notional * physics_scalar
                 vol_scalar = 1.0
             
             # Apply Minimax Constraint (CRITICAL)
@@ -750,9 +811,55 @@ class GovernorHolon(Holon):
                      if self.DEBUG: print(f"[{self.name}] 🏰 IRON BANK CAP: Limiting Risk ${max_risk_usd:.2f} -> ${self.risk_budget:.2f}")
                      max_risk_usd = self.risk_budget
             # ---------------------
+            
+            # --- PHASE 40: MONTE CARLO RUIN GUARD ---
+            # Estimate probability of hitting SL before TP using SDE
+            sl_price = self.calculate_stop_loss(symbol, direction, asset_price, current_atr)
+            tp_dist = config.SCAVENGER_SCALP_TP if state == 'SCAVENGER' else config.PREDATOR_TAKE_PROFIT
+            tp_price = asset_price * (1 + tp_dist) if direction == 'BUY' else asset_price * (1 - tp_dist)
+            
+            ruin_prob = self.calculate_ruin_probability(symbol, asset_price, direction, sl_price, tp_price, metadata)
+            
+            # RECALIBRATION: Dynamic Ruin Threshold based on Win Rate
+            perf = get_performance_data()
+            wr = perf.get('win_rate', 50.0) / 100.0
+            
+            # User Audit: Loosen if performing poorly (<30%), Tighten if performing well (>50%)
+            # Anchored to config.PHYSICS_MAX_RUIN_PROBABILITY (0.60)
+            ruin_threshold = config.PHYSICS_MAX_RUIN_PROBABILITY
+            if wr < 0.30: 
+                ruin_threshold += 0.05 # Even looser (0.65) to prevent spiral
+            elif wr > 0.50:
+                ruin_threshold -= 0.10 # Tighter (0.50) to protect win streak
+                
+            if ruin_prob > ruin_threshold:
+                 # --- SOFT VETO (Throttle) ---
+                 # If Ruin Prob is high (e.g. 100% due to GBM assumption crossing SL),
+                 # but we are trading Mean Reversion, we don't want to block entirely.
+                 # Instead, we THROTTLE the size to 10% of intended risk.
+                 throttle_factor = 0.10
+                 print(f"[{self.name}] 🎲 RUIN GUARD THROTTLE: {symbol} Prob {ruin_prob:.1%} > {ruin_threshold:.1%}. Throttling size to {throttle_factor*100:.0f}%")
+                 
+                 # Apply Throttle
+                 max_risk_usd *= throttle_factor
+                 vol_adjusted_notional *= throttle_factor
+            # ----------------------------------------
         
             # Assume mode-specific stop loss distance for risk calculation
             sl_dist = config.SCAVENGER_STOP_LOSS if state == 'SCAVENGER' else config.PREDATOR_STOP_LOSS
+            
+            # PROFILE OVERRIDE:
+            profiles = getattr(config, 'ASSET_PROFILES', {})
+            if symbol in profiles:
+                # Use satellite stop if in satellite mode?
+                # For sizing, we assume we use the profile's preferred stop if available
+                # My profiles distinguish 'stop_loss' (general) from 'satellite_stop' (often same)
+                # Let's prefer 'satellite_stop' if we are considering it a "Satellite" asset (in config list)
+                p_stop = profiles[symbol].get('satellite_stop')
+                if p_stop: 
+                    sl_dist = p_stop
+                    # print(f"[{self.name}] 🧬 Using Profile Stop Loss for {symbol}: {sl_dist:.1%}")
+
             max_notional_from_risk = max_risk_usd / sl_dist
         
             # Take minimum of volatility-adjusted and risk-constrained
@@ -1054,6 +1161,10 @@ class GovernorHolon(Holon):
 
             # Store or Delete
             if new_qty > 1e-9:
+                # --- PATCH: INVALID PRICE GUARD ---
+                if avg_price <= 0:
+                    avg_price = entry_price # Fallback to latest entry
+                
                 self.positions[symbol] = {
                     'direction': new_dir,
                     'entry_price': avg_price,
@@ -1062,12 +1173,17 @@ class GovernorHolon(Holon):
                     'first_entry_time': existing.get('first_entry_time', time.time())
                 }
                 action_tag = "STACKED" if is_same_dir else "REDUCED"
-                print(f"[{self.name}] Position {action_tag}: {symbol} (New Avg: {avg_price:.4f}, Total Qty: {new_qty:.4f})")
+                print(f"[{self.name}] Position {action_tag}: {symbol} (New Avg: {avg_price:.8f}, Total Qty: {new_qty:.4f})")
             else:
                 # Position effectively closed
                 del self.positions[symbol]
                 print(f"[{self.name}] Position CLOSED via fill: {symbol}")
         else:
+            # --- PATCH: INVALID PRICE GUARD ---
+            if entry_price <= 0: 
+                 # Critical: If we open fresh with 0, try to find ANY recent price
+                 entry_price = self.last_specific_entry.get(symbol, 0.0)
+
             self.positions[symbol] = {
                 'direction': direction,
                 'entry_price': entry_price,
@@ -1075,7 +1191,7 @@ class GovernorHolon(Holon):
                 'stack_count': 1,
                 'first_entry_time': time.time()
             }
-            print(f"[{self.name}] Position OPENED: {symbol} {direction} @ {entry_price}")
+            print(f"[{self.name}] Position OPENED: {symbol} {direction} @ {entry_price:.8f}")
         
     def close_position(self, symbol: str):
         """Clear position tracking."""
@@ -1227,6 +1343,41 @@ class GovernorHolon(Holon):
         
         # Clamp to reasonable range
         return max(config.VOL_SCALAR_MIN, min(config.VOL_SCALAR_MAX, scalar))
+
+    def calculate_sde_physics_scalar(self, metadata: Dict[str, Any], direction: str = 'BUY') -> float:
+        """
+        Physics-Based Position Scaling (SDE Layer).
+        Dynamically adjusts size based on SDE drift and diffusion.
+        """
+        if not metadata or 'sde_physics' not in metadata:
+            return 1.0
+            
+        sde = metadata['sde_physics']
+        precision_physics_scalar = 1.0
+        
+        # 1. Diffusion-Alpha (Noise Sensitivity)
+        # If Instantaneous SDE Sigma is spiking relative to ATR, we reduce size.
+        inst_vol = sde.get('sigma', 0.0)
+        if inst_vol > 1.5: # Extreme Volatility (> 150% annual)
+             precision_physics_scalar *= 0.8
+             
+        # 2. Quantum Reversion Scaling
+        reason = metadata.get('reason', '')
+        if reason in ['QUANTUM', 'QUANTUM_SELL']:
+            # For Quantum Reversion, we scale by the conviction provided by the Oracle
+            # (which is based on distance from the mean)
+            q_conv = metadata.get('quantum_conviction', 1.0)
+            precision_physics_scalar *= q_conv
+            
+        # 3. Drift Check (Optional Bonus)
+        # We don't want to over-size, so we clamp the bonus tightly
+        drift = sde.get('drift', 0.0)
+        if direction == 'BUY' and drift > 0.5:
+            precision_physics_scalar *= 1.1 # 10% Bonus for strong positive drift
+        elif direction == 'SELL' and drift < -0.5:
+            precision_physics_scalar *= 1.1
+            
+        return max(0.5, min(1.5, precision_physics_scalar))
     
     def calculate_recent_win_rate(self, lookback: int = None) -> float:
         """
@@ -1268,6 +1419,41 @@ class GovernorHolon(Holon):
                 print(f"[{self.name}] ⚠️ Win rate calculation failed: {e}")
         
         return 0.40
+
+
+    def calculate_ruin_probability(self, symbol: str, entry_price: float, direction: str, stop_loss: float, take_profit: float, metadata: Dict[str, Any]) -> float:
+        """
+        Monte Carlo Ruin Guard:
+        Uses optimized SDEEngine (Rust accelerated) to estimate 
+        the probability of hitting Stop Loss before Take Profit/Horizon.
+        """
+        if not metadata or 'sde_physics' not in metadata:
+            return 0.5 
+            
+        try:
+            from HolonicTrader.sde_engine import SDEEngine
+            sde = metadata['sde_physics']
+            # Parameters from Oracle
+            params = {
+                'mu': sde.get('mu', 0.0),
+                'sigma': sde.get('sigma', 0.1),
+                'lambda': sde.get('lambda', 0.1)
+            }
+            
+            # Use Rust-accelerated calculation
+            return SDEEngine.calculate_ruin_probability(
+                'GBM', # Default model
+                params, 
+                entry_price, 
+                stop_loss, 
+                take_profit, 
+                horizon=100, 
+                paths=500
+            )
+            
+        except Exception as e:
+            if self.DEBUG: print(f"[{self.name}] Ruin Guard Error: {e}")
+            return 0.5
 
     def check_cluster_risk(self, symbol: str) -> bool:
         """
@@ -1537,6 +1723,65 @@ class GovernorHolon(Holon):
         # Calculate Total Portfolio Equity for weighting
         # Use available_balance + notional of all positions?
         # Simpler: Use Governor's tracked equity if available, else sum
+        def check_stacking_logic(self, symbol: str, current_price: float, direction: str, atr: float = None) -> Tuple[bool, str]:
+            """
+            Phase 18: Smart Stacking
+            Only allow adding to position if:
+            1. Winning (PnL > 0)
+            2. Price moved significantly (Dynamic ATR-based Distance)
+            3. Trend is still young (< 24h)
+            4. Regime Alignment (Don't stack Longs in Bear Market)
+            """
+            if symbol not in self.positions:
+                return True, "New Position"
+                
+            pos = self.positions[symbol]
+            entry = pos['entry_price']
+            qty = pos['quantity']
+            existing_dir = pos.get('direction', 'BUY')
+            stacks = pos.get('stack_count', 1)
+            
+            # 0. Direction Check (Sanity)
+            if direction != existing_dir:
+                return False, f"Opposite Direction ({direction} vs {existing_dir})"
+                
+            # 1. PnL Check (Only stack winners)
+            pnl_pct = (current_price - entry) / entry
+            if existing_dir == 'SELL': pnl_pct *= -1
+            
+            if pnl_pct <= 0:
+                return False, f"Losing Position ({pnl_pct*100:.2f}%)"
+                
+            # 2. Distance Check (Standard + Volatility Scaling)
+            # Standard Min Dist
+            min_dist_pct = config.GOVERNOR_MIN_STACK_DIST
+            
+            # VOLATILITY SCALING (User Request)
+            if atr and current_price > 0:
+                # If Volatility is High, we need MORE distance to confirm trend
+                # Normalize ATR pct: e.g. 1% ATR -> 1.0 multiplier
+                atr_pct = atr / current_price
+                vol_multiplier = max(1.0, atr_pct / 0.01) # Baseline 1% ATR
+                min_dist_pct *= vol_multiplier
+                # print(f"[{self.name}] 📏 Dynamic Stack Dist: {min_dist_pct*100:.2f}% (Vol Mult: {vol_multiplier:.2f}x)")
+
+            current_dist = abs((current_price - entry) / entry)
+            if current_dist < min_dist_pct:
+                return False, f"Too Close (Dist {current_dist*100:.2f}% < {min_dist_pct*100:.2f}%)"
+                
+            # 3. Stack Limit
+            max_stacks = config.REGIME_PERMISSIONS['SMALL']['max_stacks'] # Default
+            if self.regime_controller:
+                max_stacks = self.regime_controller.get_permissions().get('max_stacks', 0)
+                
+            # REGIME OVERRIDE: Cap Long Stacks in Bear Market
+            # How to know regime here? We can check recent sentiment or pass it in.
+            # Fallback: Use simple trend check or external flag if available.
+            # For now, strict limit.
+            if stacks >= max_stacks:
+                return False, f"Max Stacks Reached ({stacks}/{max_stacks})"
+                
+            return True, "Stacking Approved"
         total_equity = self.available_balance
         for sym in open_positions:
             p = self.positions[sym]

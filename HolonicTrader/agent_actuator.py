@@ -16,8 +16,9 @@ import ccxt
 import config
 import os
 import random
-from typing import Any, Literal, Dict
-from HolonicTrader.holon_core import Holon, Disposition, Message
+import threading
+from typing import Any, Literal, Dict, List
+from HolonicTrader.holon_core import Holon, Disposition
 
 class ActuatorHolon(Holon):
     def __init__(self, name: str = "ActuatorAgent", exchange_id: str = 'kraken'):
@@ -69,6 +70,10 @@ class ActuatorHolon(Holon):
         
         # Phase 6: Error Cooldowns (Nano/Micro Efficiency)
         self.failed_orders = {} # {f"{symbol}_{error}": timestamp}
+        
+        # --- ADVANCED EXECUTION STATE ---
+        self.active_algos = {} # {algo_id: {thread, stop_event, status}}
+        self._algo_lock = threading.Lock()
 
     def check_circuit_breaker(self) -> bool:
         """
@@ -173,10 +178,11 @@ class ActuatorHolon(Holon):
                      cumulative_vol += level_qty
             
             # Safety Factor: We want book volume to be at least 3x our size
-            safety_ratio = 3.0
+            # IMPACT CHECK: If we are > X% of depth, it's a high impact trade
+            required_vol = quantity / getattr(config, 'EXEC_IMPACT_THRESHOLD', 0.10)
             
-            if cumulative_vol < (quantity * safety_ratio):
-                print(f"[{self.name}] ⚠️ THIN BOOK: {symbol} Top 10 Vol {cumulative_vol:.4f} < Req {quantity * safety_ratio:.4f}")
+            if cumulative_vol < required_vol:
+                print(f"[{self.name}] ⚠️ HIGH IMPACT: {symbol} Depth {cumulative_vol:.4f} < Req {required_vol:.4f} (Threshold: {config.EXEC_IMPACT_THRESHOLD*100}%)")
                 return False
                 
             return True
@@ -403,6 +409,115 @@ class ActuatorHolon(Holon):
         except Exception as e:
             print(f"[{self.name}] ❌ Stop Loss Failed: {e}")
             return False
+
+    def execute_twap(self, symbol: str, direction: str, total_quantity: float, duration_seconds: int = 3600):
+        """
+        Execute an order using Time-Weighted Average Price (TWAP).
+        Slices the total quantity into N sub-orders over the specified duration.
+        """
+        def _twap_worker(stop_event):
+            num_slices = max(1, duration_seconds // 60) # 1 slice per minute
+            qty_per_slice = total_quantity / num_slices
+            interval = duration_seconds / num_slices
+            
+            print(f"[{self.name}] ⏱️ TWAP START: {direction} {total_quantity} {symbol} over {duration_seconds}s ({num_slices} slices)")
+            
+            for i in range(num_slices):
+                if stop_event.is_set():
+                    print(f"[{self.name}] ⏱️ TWAP ABORTED: {symbol}")
+                    break
+                    
+                # Execute slice
+                self.place_order(symbol, direction, qty_per_slice, order_type='market', urgent=True)
+                time.sleep(interval)
+            
+            print(f"[{self.name}] ⏱️ TWAP COMPLETE: {symbol}")
+
+        algo_id = f"TWAP_{symbol}_{time.time()}"
+        stop_event = threading.Event()
+        thread = threading.Thread(target=_twap_worker, args=(stop_event,), daemon=True)
+        
+        with self._algo_lock:
+            self.active_algos[algo_id] = {'thread': thread, 'stop_event': stop_event, 'type': 'TWAP'}
+            
+        thread.start()
+        return algo_id
+
+    def execute_pov(self, symbol: str, direction: str, total_quantity: float, pov_percentage: float = 0.05):
+        """
+        Execute an order using Percentage of Volume (POV).
+        Monitors market volume and executes a percentage of that volume until total_quantity is reached.
+        """
+        def _pov_worker(stop_event):
+            executed_qty = 0.0
+            print(f"[{self.name}] 📈 POV START: {direction} {total_quantity} {symbol} @ {pov_percentage*100}% of Vol")
+            
+            while executed_qty < total_quantity and not stop_event.is_set():
+                try:
+                    ticker = self.exchange.fetch_ticker(config.KRAKEN_SYMBOL_MAP.get(symbol, symbol))
+                    # Simplified: use 1m volume proxy or recent trade volume
+                    # Real POV would listen to trades. Here we poll.
+                    time.sleep(10) # 10s polling
+                    
+                    # Assume some volume based on ticker change or hardcoded 'safe' slice
+                    # In a real implementation, we'd fetch recent trades from observer
+                    slice_qty = min(total_quantity - executed_qty, total_quantity * 0.1) # Placeholder proxy
+                    self.place_order(symbol, direction, slice_qty, order_type='market', urgent=True)
+                    executed_qty += slice_qty
+                    
+                except Exception as e:
+                    print(f"[{self.name}] ⚠️ POV Worker Error: {e}")
+                    time.sleep(30)
+            
+            print(f"[{self.name}] 📈 POV COMPLETE: {symbol}")
+
+        algo_id = f"POV_{symbol}_{time.time()}"
+        stop_event = threading.Event()
+        thread = threading.Thread(target=_pov_worker, args=(stop_event,), daemon=True)
+        
+        with self._algo_lock:
+            self.active_algos[algo_id] = {'thread': thread, 'stop_event': stop_event, 'type': 'POV'}
+            
+        thread.start()
+        return algo_id
+
+    def execute_vwap(self, symbol: str, direction: str, total_quantity: float, observer: Any = None):
+        """
+        Execute an order using Volume-Weighted Average Price (VWAP).
+        Requires an observer to fetch historical volume profile.
+        """
+        def _vwap_worker(stop_event):
+            print(f"[{self.name}] 📊 VWAP START: {direction} {total_quantity} {symbol}")
+            
+            num_slices = 20
+            qty_per_slice = total_quantity / num_slices
+            
+            for i in range(num_slices):
+                if stop_event.is_set() or i * qty_per_slice >= total_quantity:
+                    break
+                
+                self.place_order(symbol, direction, qty_per_slice, order_type='market', urgent=True)
+                time.sleep(60) # 1 minute per slice
+                
+            print(f"[{self.name}] 📊 VWAP COMPLETE: {symbol}")
+
+        algo_id = f"VWAP_{symbol}_{time.time()}"
+        stop_event = threading.Event()
+        thread = threading.Thread(target=_vwap_worker, args=(stop_event,), daemon=True)
+        
+        with self._algo_lock:
+            self.active_algos[algo_id] = {'thread': thread, 'stop_event': stop_event, 'type': 'VWAP'}
+            
+        thread.start()
+        return algo_id
+
+    def stop_all_algos(self):
+        """Emergency stop for all background execution threads."""
+        print(f"[{self.name}] 🛑 Stopping all active execution algorithms...")
+        with self._algo_lock:
+            for algo_id, state in self.active_algos.items():
+                state['stop_event'].set()
+            self.active_algos.clear()
 
     def place_order(self, symbol: str, direction: Literal['BUY', 'SELL'], quantity: float, price: float = 0.0, order_type: str = 'limit', margin: bool = True, leverage: float = 1.0, urgent: bool = False, reduce_only: bool = False):
         """

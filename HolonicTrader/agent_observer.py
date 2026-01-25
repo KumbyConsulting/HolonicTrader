@@ -15,6 +15,8 @@ from requests.adapters import HTTPAdapter
 import config
 
 import threading
+import asyncio
+import ccxt.pro as ccxtpro
 
 class ObserverHolon(Holon):
     """
@@ -58,8 +60,138 @@ class ObserverHolon(Holon):
         
         # Data Cache (Instance level alias to shared?)
         # self._cache = {} # Legacy instance cache
+        # WS Cache
         self._ticker_cache = {}
         self._last_ticker_fetch = 0.0
+        
+        # --- PHASE 46.2: WEBSOCKET INFRASTRUCTURE ---
+        self._ws_enabled = False
+        self._ws_symbols = []
+        self._ws_thread = None
+        self._ws_loop = None
+        self._ws_exchange = None
+        self._ws_trades_log = {} # symbol -> [trades]
+        
+        # Determine if we should start WS (only for primary exchange if needed)
+        # For now, we allow any ObserverHolon to start WS if symbols are provided
+        if config.TRADING_MODE == 'FUTURES' or exchange_id == 'krakenfutures':
+            self._ws_enabled = True
+            # Start in a separate method to avoid blocking init
+
+    def start_ws(self, symbols: List[str] = None):
+        """Starts the background WebSocket thread."""
+        if not self._ws_enabled or self._ws_thread is not None:
+            return
+            
+        # Use provided symbols or default university
+        watch_list = symbols if symbols else [self.symbol]
+        # Map symbols for Kraken Futures if needed
+        if self.exchange_id == 'krakenfutures':
+            watch_list = [config.KRAKEN_SYMBOL_MAP.get(s, s) for s in watch_list]
+            
+        self._ws_symbols = watch_list
+        print(f"[{self.name}] 📡 Starting WebSocket Stream for {len(self._ws_symbols)} assets...")
+        
+        self._ws_thread = threading.Thread(target=self._run_ws_loop, daemon=True)
+        self._ws_thread.start()
+
+    def _run_ws_loop(self):
+        """Entry point for the WS thread."""
+        self._ws_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._ws_loop)
+        try:
+            self._ws_loop.run_until_complete(self._ws_main_loop())
+        except Exception as e:
+            print(f"[{self.name}] ❌ WebSocket Thread Crashed: {e}")
+
+    async def _ws_main_loop(self):
+        """The actual async loop using ccxt.pro."""
+        ws_config = {'enableRateLimit': True}
+        
+        # Add API keys if available for private streams (though we mostly use public here)
+        if self.exchange_id == 'krakenfutures':
+            if config.KRAKEN_FUTURES_API_KEY:
+                ws_config['apiKey'] = config.KRAKEN_FUTURES_API_KEY
+                ws_config['secret'] = config.KRAKEN_FUTURES_PRIVATE_KEY
+        
+        self._ws_exchange = getattr(ccxtpro, self.exchange_id)(ws_config)
+        
+        try:
+            tasks = [
+                self._watch_tickers_loop(),
+                self._watch_trades_loop()
+            ]
+            await asyncio.gather(*tasks)
+        finally:
+            await self._ws_exchange.close()
+
+    async def _watch_tickers_loop(self):
+        """Background loop to update ticker cache via WS."""
+        while True:
+            try:
+                # CCXT.pro unified watch_tickers
+                # If we have a lot of symbols, some exchanges prefer a list
+                tickers = await self._ws_exchange.watch_tickers(self._ws_symbols)
+                
+                # Update synchronous cache
+                self._ticker_cache.update(tickers)
+                self._last_ticker_fetch = time.time()
+                
+            except Exception as e:
+                # print(f"[{self.name}] WS Ticker Loop Error: {e}")
+                await asyncio.sleep(5)
+
+    def update_ws_symbols(self, symbols: List[str]):
+        """Dynamically updates the symbols being watched by WS."""
+        if not self._ws_enabled or not symbols:
+            return
+            
+        new_list = symbols
+        if self.exchange_id == 'krakenfutures':
+            new_list = [config.KRAKEN_SYMBOL_MAP.get(s, s) for s in symbols]
+            
+        # Filter duplicates and check if changed
+        new_set = set(new_list)
+        if new_set != set(self._ws_symbols):
+            self._ws_symbols = list(new_set)
+            print(f"[{self.name}] 🔄 WebSocket Subscriptions Updated: {len(self._ws_symbols)} assets.")
+            # CCXT.pro handles the new symbols on the next watch_tickers call usually,
+            # but some exchanges might need a reconnect or specific logic.
+            # For Kraken Futures, watch_tickers(symbols) works well.
+
+    async def _watch_trades_loop(self):
+        """Background loop to update trade log via WS."""
+        while True:
+            try:
+                # watch_trades usually returns one symbol at a time or uses a shared stream
+                # In CCXT.pro, watchTrades(symbol) blocks until a trade for THAT symbol arrives.
+                # To watch multiple symbols, we might need a separate task per symbol or use an exchange-specific multi-symbol method.
+                # For now, let's watch the primary symbol and a few others if the list is small.
+                
+                # Optimized approach for multiple symbols in CCXT.pro:
+                # Some exchanges support watchTrades(None) for all. Kraken Futures might not.
+                # Let's just watch the symbols in a loop or concurrently.
+                
+                async def watch_single(symbol):
+                    while True:
+                        try:
+                            trades = await self._ws_exchange.watch_trades(symbol)
+                            if symbol not in self._ws_trades_log:
+                                self._ws_trades_log[symbol] = []
+                            # Keep only last 100 trades for OMI/Physics
+                            self._ws_trades_log[symbol].extend(trades)
+                            if len(self._ws_trades_log[symbol]) > 100:
+                                self._ws_trades_log[symbol] = self._ws_trades_log[symbol][-100:]
+                        except Exception:
+                            await asyncio.sleep(1)
+
+                sub_tasks = [watch_single(s) for s in self._ws_symbols[:10]] # Cap at 10 for safety
+                await asyncio.gather(*sub_tasks)
+                
+            except Exception as e:
+                # print(f"[{self.name}] WS Trade Loop Error: {e}")
+                await asyncio.sleep(5)
+                break
 
     import time
 
@@ -118,9 +250,37 @@ class ObserverHolon(Holon):
         if not os.path.exists(filepath):
             # print(f"[{self.name}] No local history for {symbol} at {filepath}") # Reduce noise
             return pd.DataFrame()
-            
-        print(f"[{self.name}] Loading local history for {symbol} from {filepath} (DISK READ)")
-        df = self.load_data_from_csv(filepath)
+
+        # === OPTIMIZATION: Pickle Cache ===
+        pickle_path = filepath.replace('.csv', '.pkl')
+        use_pickle = False
+        
+        if os.path.exists(pickle_path):
+            csv_mtime = os.path.getmtime(filepath)
+            pkl_mtime = os.path.getmtime(pickle_path)
+            if pkl_mtime >= csv_mtime:
+                use_pickle = True
+        
+        if use_pickle:
+            try:
+                # Fast Path
+                # print(f"[{self.name}] ⚡ Loading cached history for {symbol}") 
+                df = pd.read_pickle(pickle_path)
+            except Exception:
+                # Fallback if pickle corrupt
+                print(f"[{self.name}] ⚠️ Pickle corrupt, falling back to CSV for {symbol}")
+                df = self.load_data_from_csv(filepath)
+        else:
+            # Slow Path
+            print(f"[{self.name}] Loading local history for {symbol} from {filepath} (DISK READ)")
+            df = self.load_data_from_csv(filepath)
+            # Save Pickle for next time
+            if not df.empty:
+                try:
+                    df.to_pickle(pickle_path)
+                    print(f"[{self.name}] 💾 Cached {symbol} to Pickle.")
+                except Exception as e:
+                    print(f"[{self.name}] ⚠️ Failed to save pickle: {e}")
         
         # 2. Populate Shared Cache
         with self._shared_cache_lock:
@@ -223,8 +383,8 @@ class ObserverHolon(Holon):
         with ThreadPoolExecutor(max_workers=config.CCXT_POOL_SIZE) as executor:
             future_to_symbol = {}
             for symbol in symbols:
-                # STAGGERED POLLING: Sleep 0.2s between submissions to prevent 429 bursts
-                time.sleep(0.2) 
+                # Optimized submissions: Reduced from 0.2s to 0.05s to maximize pool utilization
+                time.sleep(0.05) 
                 future = executor.submit(self.fetch_market_data, target_timeframe, limit, symbol)
                 future_to_symbol[future] = symbol
             
@@ -239,21 +399,121 @@ class ObserverHolon(Holon):
                     
         return results
 
+    def fetch_matrix_data(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+        """
+        Unified High-Speed Data Sink:
+        Fetches 15m OHLCV, 1h OHLCV, Books, and Funding in a single parallel burst.
+        Eliminates redundant loop overhead in the Trader cycles.
+        """
+        results = {}
+        target_15m = config.TIMEFRAME # usually 15m
+        target_1h = '1h'
+
+        def fetch_asset_unit(symbol):
+            try:
+                # 1. Fetch 15m (Entry/Risk)
+                df_15m = self.fetch_market_data(timeframe=target_15m, limit=100, symbol=symbol)
+                # 2. Fetch 1h (Regime/Structure)
+                df_1h = self.fetch_market_data(timeframe=target_1h, limit=50, symbol=symbol)
+                # 3. Order Book
+                book = self.fetch_order_book(symbol, limit=20)
+                # 4. Funding (Futures Only)
+                funding = self.fetch_funding_rate(symbol)
+                
+                return symbol, {
+                    'df_15m': df_15m,
+                    'df_1h': df_1h,
+                    'book': book,
+                    'funding': funding
+                }
+            except Exception as e:
+                print(f"[{self.name}] ⚠️ Matrix Unit Fetch Failed for {symbol}: {e}")
+                return symbol, None
+
+        with ThreadPoolExecutor(max_workers=config.CCXT_POOL_SIZE) as executor:
+            futures = {executor.submit(fetch_asset_unit, s): s for s in symbols}
+            for future in as_completed(futures):
+                sym, data = future.result()
+                if data:
+                    results[sym] = data
+        
+        return results
+
     def get_latest_price(self, symbol: str = None) -> float:
         """
         Returns the current market price (last close).
+        Prioritizes WebSocket Cache for Warp Velocity.
+        
+        FIX 2: Circuit Breaker - Zero-price detection and deviation alerts.
         """
         target_symbol = symbol if symbol else self.symbol
-        for attempt in range(3):
-            try:
-                ticker = self.exchange.fetch_ticker(target_symbol)
-                return float(ticker['last'])
-            except (ccxt.NetworkError, ccxt.ExchangeError) as e:
-                if attempt == 2:
-                    print(f"[{self.name}] ⚠️ Price Fetch Error {target_symbol}: {e}")
-                    return 0.0
-                time.sleep(1 * (attempt + 1))
-        return 0.0
+        
+        # 1. Map for Kraken Futures
+        if self.exchange_id == 'krakenfutures':
+            target_symbol = config.KRAKEN_SYMBOL_MAP.get(target_symbol, target_symbol)
+        
+        price = 0.0
+        
+        # 2. Check WS Cache
+        if target_symbol in self._ticker_cache:
+            ticker = self._ticker_cache[target_symbol]
+            if ticker and 'last' in ticker:
+                price = float(ticker['last'])
+                
+        # 3. Fallback to REST if WS failed
+        if price == 0.0:
+            for attempt in range(3):
+                try:
+                    ticker = self.exchange.fetch_ticker(target_symbol)
+                    price = float(ticker['last'])
+                    break
+                except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+                    if attempt == 2:
+                        print(f"[{self.name}] ⚠️ Price Fetch Error {target_symbol}: {e}")
+                    time.sleep(1 * (attempt + 1))
+        
+        # --- FIX 2: CIRCUIT BREAKER ---
+        # Maintain last valid price cache
+        if not hasattr(self, '_last_valid_prices'):
+            self._last_valid_prices = {}
+        
+        last_valid = self._last_valid_prices.get(target_symbol, 0.0)
+        
+        # A. Zero-Price Detection
+        if price == 0.0 or price is None:
+            if last_valid > 0:
+                print(f"[{self.name}] 🚨 CIRCUIT BREAKER: {target_symbol} returned $0.00! Using last valid ${self.normalize_price(last_valid)}")
+                return last_valid
+            else:
+                print(f"[{self.name}] 🚨 CIRCUIT BREAKER: {target_symbol} has NO valid price data!")
+                return 0.0
+        
+        # B. Deviation Alert (>50% spike/drop)
+        if last_valid > 0:
+            deviation = abs(price - last_valid) / last_valid
+            if deviation > 0.50:
+                print(f"[{self.name}] ⚠️ PRICE DEVIATION ALERT: {target_symbol} moved {deviation:.0%}! (${self.normalize_price(last_valid)} -> ${self.normalize_price(price)})")
+        
+        # C. Update valid price cache
+        self._last_valid_prices[target_symbol] = price
+        # -----------------------------
+        
+        return price
+
+
+    @staticmethod
+    def normalize_price(price: float) -> str:
+        """
+        Smart formatter for sub-penny assets.
+        0.00001234 -> "0.00001234"
+        10.50 -> "10.50"
+        """
+        if price < 0.01:
+            return f"{price:.8f}".rstrip('0').rstrip('.')
+        elif price < 1.0:
+            return f"{price:.4f}"
+        else:
+            return f"{price:.2f}"
 
     def fetch_order_book(self, symbol: str, limit: int = 20) -> dict:
         """

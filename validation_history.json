@@ -1,0 +1,437 @@
+[
+    {
+        "timestamp": 1769349638.2442937,
+        "symbol": "BTC/USDT",
+        "genome": {
+            "rsi_buy": 40.28822771145879,
+            "rsi_sell": 83.83347336696428,
+            "stop_loss": 0.013791891345888754,
+            "take_profit": 0.07232493308916264,
+            "use_satellite": true,
+            "sat_rvol": 2.4558243024417905,
+            "sat_bb_expand": 0.05685272207101793,
+            "leverage_cap": 4.38,
+            "trailing_activation": 1.077531439518295,
+            "trailing_distance": 0.023960178018774113
+        },
+        "stats": {
+            "trade_count": 6,
+            "pnl_pct": -0.03164445247716833,
+            "max_drawdown": 0.0354569882964504,
+            "win_rate": 0.0
+        },
+        "checks": {
+            "sufficient_trades": false,
+            "controlled_drawdown": true,
+            "positive_pnl": false,
+            "sanity": true
+        },
+        "promoted": false
+    },
+    {
+        "timestamp": 1769350619.4452872,
+        "symbol": "BTC/USDT",
+        "genome": {
+            "rsi_buy": 49.585302460317564,
+            "rsi_sell": 93.23682257938452,
+            "stop_loss": 0.012502997598636888,
+            "take_profit": 0.06475990848082368,
+            "use_satellite": true,
+            "sat_rvol": 4.090298842741161,
+            "sat_bb_expand": 0.06572364373692297,
+            "leverage_cap": 2.07,
+            "trailing_activation": 1.0938746912519668,
+            "trailing_distance": 0.04308501146431509
+        },
+        "stats": {
+            "trade_count": 7,
+            "pnl_pct": -0.03639548832937339,
+            "max_drawdown": 0.042523218430948966,
+            "win_rate": 0.0
+        },
+        "checks": {
+            "sufficient_trades": false,
+            "controlled_drawdown": true,
+            "positive_pnl": false,
+            "sanity": true
+        },
+        "promoted": false
+    },
+    {
+        "timestamp": 1769351546.6736119,
+        "symbol": "BTC/USDT",
+        "genome": {
+            "rsi_buy": 41.61320141407596,
+            "rsi_sell": 88.29783987664986,
+            "stop_loss": 0.04082645885255555,
+            "take_profit": 0.0705357555536535,
+            "use_satellite": true,
+            "sat_rvol": 2.305090005164913,
+            "sat_bb_expand": 0.06656301368753781,
+            "leverage_cap": 4.499558456604623,
+            "trailing_activation": 1.1502221078557973,
+            "trailing_distance": 0.04451565955585131
+        },
+        "stats": {
+            "trade_count": 2,
+            "pnl_pct": -0.03389726068086543,
+            "max_drawdown": 0.03389726068086543,
+            "win_rate": 0.0
+        },
+        "checks": {
+            "sufficient_trades": false,
+            "controlled_drawdown": true,
+            "positive_pnl": false,
+            "sanity": true
+        },
+        "promoted": false
+    },
+    {
+        "timestamp": 1769357263.3870807,
+        "symbol": "BTC/USDT",
+        "genome": {
+            "rsi_buy": 31.482661520980464,
+            "rsi_sell": 84.41149746305452,
+            "stop_loss": 0.02207880370458925,
+            "take_profit": 0.07259992709136613,
+            "use_satellite": true,
+            "sat_rvol": 2.097293453819523,
+            "sat_bb_expand": 0.05115806890643926,
+            "leverage_cap": 3.79,
+            "trailing_activation": 0.8581092651599734,
+            "trailing_distance": 0.020026056121139287
+        },
+        "stats": {
+            "trade_count": 4,
+            "pnl_pct": -0.030529794774445007,
+            "max_drawdown": 0.041774564934573905,
+            "win_rate": 0.0
+        },
+        "checks": {
+            "sufficient_trades": false,
+            "controlled_drawdown": true,
+            "positive_pnl": false,
+            "sanity": true
+        },
+        "promoted": false
+    },
+    {
+        "timestamp": 1769358105.275315,
+        "symbol": "BTC/USDT",
+        "genome": {
+            "rsi_buy": 30.311085798866493,
+            "rsi_sell": 82.56323621196266,
+            "stop_loss": 0.048576432119988563,
+            "take_profit": 0.08176309933709755,
+            "use_satellite": true,
+            "sat_rvol": 3.445387170403756,
+            "sat_bb_expand": 0.06848390325357195,
+            "leverage_cap": 4.68,
+            "trailing_activation": 1.421493372965091,
+            "trailing_distance": 0.03652736641943065
+        },
+        "stats": {
+            "trade_count": 1,
+            "pnl_pct": -0.015299189555073098,
+            "max_drawdown": 0.025512356060086405,
+            "win_rate": 0.0
+        },
+        "checks": {
+            "sufficient_trades": false,
+            "controlled_drawdown": true,
+            "positive_pnl": false,
+            "sanity": true
+        },
+        "promoted": false
+    },
+    {
+        "timestamp": 1769358953.3983345,
+        "symbol": "BTC/USDT",
+        "genome": {
+            "rsi_buy": 40.18551734522492,
+            "rsi_sell": 88.81053275904861,
+            "stop_loss": 0.0481192376044873,
+            "take_profit": 0.18763275195153084,
+            "use_satellite": true,
+            "sat_rvol": 3.81153521840133,
+            "sat_bb_expand": 0.07518003743702453,
+            "leverage_cap": 3.92,
+            "trailing_activation": 1.0375324845256975,
+            "trailing_distance": 0.01364751556967042
+        },
+        "stats": {
+            "trade_count": 1,
+            "pnl_pct": -0.016054612759129214,
+            "max_drawdown": 0.026117432833479698,
+            "win_rate": 0.0
+        },
+        "checks": {
+            "sufficient_trades": false,
+            "controlled_drawdown": true,
+            "positive_pnl": false,
+            "sanity": true
+        },
+        "promoted": false
+    },
+    {
+        "timestamp": 1769359863.3902526,
+        "symbol": "BTC/USDT",
+        "genome": {
+            "rsi_buy": 41.57900096010575,
+            "rsi_sell": 91.24865185767628,
+            "stop_loss": 0.04389118843959681,
+            "take_profit": 0.0687987846939742,
+            "use_satellite": true,
+            "sat_rvol": 2.7049277075889613,
+            "sat_bb_expand": 0.07397906997665338,
+            "leverage_cap": 3.65,
+            "trailing_activation": 0.5771913754815413,
+            "trailing_distance": 0.03641155926123109
+        },
+        "stats": {
+            "trade_count": 2,
+            "pnl_pct": -0.03605377469755365,
+            "max_drawdown": 0.03605377469755365,
+            "win_rate": 0.0
+        },
+        "checks": {
+            "sufficient_trades": false,
+            "controlled_drawdown": true,
+            "positive_pnl": false,
+            "sanity": true
+        },
+        "promoted": false
+    },
+    {
+        "timestamp": 1769360730.3389637,
+        "symbol": "BTC/USDT",
+        "genome": {
+            "rsi_buy": 30.03631748218478,
+            "rsi_sell": 92.80959019930052,
+            "stop_loss": 0.04938183106729572,
+            "take_profit": 0.06872349223480402,
+            "use_satellite": true,
+            "sat_rvol": 4.119777508788335,
+            "sat_bb_expand": 0.06972627890160961,
+            "leverage_cap": 3.43,
+            "trailing_activation": 0.9965411604503419,
+            "trailing_distance": 0.045092834131390105
+        },
+        "stats": {
+            "trade_count": 1,
+            "pnl_pct": -0.015588963497640634,
+            "max_drawdown": 0.02579912451155167,
+            "win_rate": 0.0
+        },
+        "checks": {
+            "sufficient_trades": false,
+            "controlled_drawdown": true,
+            "positive_pnl": false,
+            "sanity": true
+        },
+        "promoted": false
+    },
+    {
+        "timestamp": 1769361566.7595,
+        "symbol": "BTC/USDT",
+        "genome": {
+            "rsi_buy": 33.74446198804062,
+            "rsi_sell": 94.26832020562341,
+            "stop_loss": 0.013757364806271273,
+            "take_profit": 0.056147709061038074,
+            "use_satellite": true,
+            "sat_rvol": 3.4902290099956144,
+            "sat_bb_expand": 0.06164934542555394,
+            "leverage_cap": 4.94,
+            "trailing_activation": 1.0417881055802936,
+            "trailing_distance": 0.034209273825416255
+        },
+        "stats": {
+            "trade_count": 5,
+            "pnl_pct": -0.03175315019140566,
+            "max_drawdown": 0.032954280124247365,
+            "win_rate": 0.0
+        },
+        "checks": {
+            "sufficient_trades": false,
+            "controlled_drawdown": true,
+            "positive_pnl": false,
+            "sanity": true
+        },
+        "promoted": false
+    },
+    {
+        "timestamp": 1769362524.9337986,
+        "symbol": "BTC/USDT",
+        "genome": {
+            "rsi_buy": 28.246724784359557,
+            "rsi_sell": 82.1427557093847,
+            "stop_loss": 0.04109038303583167,
+            "take_profit": 0.07885949509593697,
+            "use_satellite": true,
+            "sat_rvol": 3.2968171993809343,
+            "sat_bb_expand": 0.07125520938998808,
+            "leverage_cap": 3.45,
+            "trailing_activation": 1.1227197857059523,
+            "trailing_distance": 0.017564320557244703
+        },
+        "stats": {
+            "trade_count": 1,
+            "pnl_pct": -0.01612970761063275,
+            "max_drawdown": 0.026267231920528048,
+            "win_rate": 0.0
+        },
+        "checks": {
+            "sufficient_trades": false,
+            "controlled_drawdown": true,
+            "positive_pnl": false,
+            "sanity": true
+        },
+        "promoted": false
+    },
+    {
+        "timestamp": 1769363370.4674373,
+        "symbol": "BTC/USDT",
+        "genome": {
+            "rsi_buy": 33.62416655233195,
+            "rsi_sell": 85.77435746122914,
+            "stop_loss": 0.03056140201086579,
+            "take_profit": 0.07901104858610812,
+            "use_satellite": true,
+            "sat_rvol": 2.669872329666176,
+            "sat_bb_expand": 0.0729872893560067,
+            "leverage_cap": 3.37,
+            "trailing_activation": 0.15152786883562264,
+            "trailing_distance": 0.026490470636241985
+        },
+        "stats": {
+            "trade_count": 3,
+            "pnl_pct": -0.03344020545152455,
+            "max_drawdown": 0.034639242557963884,
+            "win_rate": 0.0
+        },
+        "checks": {
+            "sufficient_trades": false,
+            "controlled_drawdown": true,
+            "positive_pnl": false,
+            "sanity": true
+        },
+        "promoted": false
+    },
+    {
+        "timestamp": 1769364208.0402682,
+        "symbol": "BTC/USDT",
+        "genome": {
+            "rsi_buy": 43.29940192429014,
+            "rsi_sell": 81.6426702024564,
+            "stop_loss": 0.025236281741499146,
+            "take_profit": 0.08237318804035333,
+            "use_satellite": true,
+            "sat_rvol": 3.4813153165904263,
+            "sat_bb_expand": 0.07453782064482158,
+            "leverage_cap": 4.3,
+            "trailing_activation": 1.4303486853549254,
+            "trailing_distance": 0.0361381971053088
+        },
+        "stats": {
+            "trade_count": 3,
+            "pnl_pct": -0.028589539213654234,
+            "max_drawdown": 0.03866425760500693,
+            "win_rate": 0.0
+        },
+        "checks": {
+            "sufficient_trades": false,
+            "controlled_drawdown": true,
+            "positive_pnl": false,
+            "sanity": true
+        },
+        "promoted": false
+    },
+    {
+        "timestamp": 1769365092.1880744,
+        "symbol": "BTC/USDT",
+        "genome": {
+            "rsi_buy": 35.41384328274425,
+            "rsi_sell": 80.27846953505616,
+            "stop_loss": 0.03511456463464294,
+            "take_profit": 0.06004712744801095,
+            "use_satellite": true,
+            "sat_rvol": 3.5174231135148335,
+            "sat_bb_expand": 0.05312369010124421,
+            "leverage_cap": 2.03,
+            "trailing_activation": 0.2823338934641505,
+            "trailing_distance": 0.02037833064228824
+        },
+        "stats": {
+            "trade_count": 3,
+            "pnl_pct": -0.03081158816417917,
+            "max_drawdown": 0.03201388612388793,
+            "win_rate": 0.0
+        },
+        "checks": {
+            "sufficient_trades": false,
+            "controlled_drawdown": true,
+            "positive_pnl": false,
+            "sanity": true
+        },
+        "promoted": false
+    },
+    {
+        "timestamp": 1769366052.5989652,
+        "symbol": "BTC/USDT",
+        "genome": {
+            "rsi_buy": 31.982362917118337,
+            "rsi_sell": 80.11111380650033,
+            "stop_loss": 0.030523811031150816,
+            "take_profit": 0.07540284951043089,
+            "use_satellite": true,
+            "sat_rvol": 3.427959026121769,
+            "sat_bb_expand": 0.06595748686891006,
+            "leverage_cap": 4.51,
+            "trailing_activation": 0.9309990551221811,
+            "trailing_distance": 0.026888995627354396
+        },
+        "stats": {
+            "trade_count": 3,
+            "pnl_pct": -0.03340654087619146,
+            "max_drawdown": 0.03460561974422198,
+            "win_rate": 0.0
+        },
+        "checks": {
+            "sufficient_trades": false,
+            "controlled_drawdown": true,
+            "positive_pnl": false,
+            "sanity": true
+        },
+        "promoted": false
+    },
+    {
+        "timestamp": 1769367180.7050874,
+        "symbol": "BTC/USDT",
+        "genome": {
+            "rsi_buy": 44.74792646420899,
+            "rsi_sell": 94.41696251607748,
+            "stop_loss": 0.021971176963285995,
+            "take_profit": 0.18448046007317837,
+            "use_satellite": true,
+            "sat_rvol": 3.0591043051999427,
+            "sat_bb_expand": 0.054275044720381804,
+            "leverage_cap": 4.74,
+            "trailing_activation": 1.3593889700206059,
+            "trailing_distance": 0.012675796387492295
+        },
+        "stats": {
+            "trade_count": 4,
+            "pnl_pct": -0.03455009703555561,
+            "max_drawdown": 0.044562997128737604,
+            "win_rate": 0.0
+        },
+        "checks": {
+            "sufficient_trades": false,
+            "controlled_drawdown": true,
+            "positive_pnl": false,
+            "sanity": true
+        },
+        "promoted": false
+    }
+]
