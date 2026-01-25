@@ -433,5 +433,63 @@
             "sanity": true
         },
         "promoted": false
+    },
+    {
+        "timestamp": 1769369074.5906765,
+        "symbol": "LTC/USDT",
+        "genome": {
+            "rsi_buy": 19.815888401238432,
+            "rsi_sell": 89.77860270942557,
+            "stop_loss": 0.014655516282558088,
+            "take_profit": 0.11520905030883666,
+            "use_satellite": true,
+            "sat_rvol": 4.657420954496752,
+            "sat_bb_expand": 0.2477689486246621,
+            "leverage_cap": 2.83,
+            "trailing_activation": 1.1529661621684955,
+            "trailing_distance": 0.014370707993918402
+        },
+        "stats": {
+            "trade_count": 1,
+            "pnl_pct": 0.00021378124161901724,
+            "max_drawdown": 0.007438683417700259,
+            "win_rate": 0.3333333333333333
+        },
+        "checks": {
+            "sufficient_trades": false,
+            "controlled_drawdown": true,
+            "positive_pnl": true,
+            "sanity": true
+        },
+        "promoted": false
+    },
+    {
+        "timestamp": 1769369208.1069725,
+        "symbol": "BTC/USDT",
+        "genome": {
+            "rsi_buy": 43.98097609376859,
+            "rsi_sell": 90.0,
+            "stop_loss": 0.046490507085177324,
+            "take_profit": 0.11520905030883666,
+            "use_satellite": true,
+            "sat_rvol": 3.6701925491231524,
+            "sat_bb_expand": 0.06161262131751342,
+            "leverage_cap": 2.83,
+            "trailing_activation": 0.8855059639036649,
+            "trailing_distance": 0.010099309196874295
+        },
+        "stats": {
+            "trade_count": 1,
+            "pnl_pct": -0.023591615911352847,
+            "max_drawdown": 0.03358731924308995,
+            "win_rate": 0.0
+        },
+        "checks": {
+            "sufficient_trades": false,
+            "controlled_drawdown": true,
+            "positive_pnl": true,
+            "sanity": true
+        },
+        "promoted": false
     }
 ]

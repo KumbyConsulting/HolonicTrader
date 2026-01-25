@@ -258,12 +258,13 @@ class EvolutionLab:
         
         # 1. Survival Factor (Heavy Penalty for DD)
         survival_score = 1.0
-        if avg_dd > 0.15: survival_score -= (avg_dd - 0.15) * 2.0 # Linear penalty start
-        if avg_dd > 0.30: survival_score = 0.1 # Death Zone
+        if avg_dd > 0.25: survival_score -= (avg_dd - 0.25) * 2.0 # Relaxed from 0.15
+        if avg_dd > 0.50: survival_score = 0.2 # Relaxed death zone from 0.30
         
         # 2. Activity Check (Avoid dead strategies)
-        if total_trades < (valid_arenas * 2): # Min 2 trades per asset avg
-            survival_score *= 0.5
+        # Relaxed: Only punish if practically zero trades (< 0.5 per arena)
+        if total_trades < (valid_arenas * 0.5): 
+            survival_score *= 0.8 # Less harsh penalty (was 0.5)
             
         # 3. Core Score: Sharpe + Sortino + ROI
         # Weighting: Reliability (60%), Growth (40%)
@@ -271,13 +272,16 @@ class EvolutionLab:
         c_sharpe = min(avg_sharpe, 3.0) 
         c_sortino = min(avg_sortino, 5.0)
         
-        raw_score = (c_sharpe * 2.0) + (c_sortino * 1.0) + (avg_roi * 10.0)
+        # AGGRESSIVE BOOST: Scale ROI higher to reward ANY profit in bear markets
+        # Add constant 1.0 base to raw_score to prevent multipication to zero if metrics are slightly negative
+        raw_score = 1.0 + (c_sharpe * 2.0) + (c_sortino * 1.0) + (avg_roi * 20.0)
         
         # 4. Quadratic Drawdown Penalty (RECALIBRATION)
-        # 10% DD = 1 / (1 + (1)^2) = 0.5x
-        # 20% DD = 1 / (1 + (2)^2) = 0.2x
-        # 40% DD = 1 / (1 + (4)^2) = 0.05x (Hard Penalty)
-        dd_penalty = 1.0 / (1.0 + (avg_dd * 10.0)**2)
+        # Relaxed Curve: 
+        # 10% DD = 1 / (1 + (0.5)^2) = ~0.8x
+        # 40% DD = 1 / (1 + (2.0)^2) = 0.2x
+        dd_penalty = 1.0 / (1.0 + (avg_dd * 5.0)**2) # Was * 10.0 (too harsh)
+
         
         # 5. Overfit Penalty: If Train ROI is 2x Val ROI
         # overfit_penalty = max(0, (train_roi - val_roi) * 2.0)

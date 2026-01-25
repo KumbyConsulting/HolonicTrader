@@ -1172,6 +1172,11 @@ class EntryOracleHolon(Holon):
         from .agent_executor import TradeSignal # Ensure import
         is_whale = False # Default initialization
         prices = window_data['close']
+        
+        # Default Initializations (Fix for UnboundLocalError)
+        rsi = 50.0
+        rvol = 1.0
+        is_whale = False
 
         # 🔑 KEY 0: SCAVENGER TRAP (Pattern Override)
         # Does this asset look like it just trapped bears at support?

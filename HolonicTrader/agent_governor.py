@@ -10,7 +10,7 @@ Implements:
 from typing import Any, Tuple, Literal, Dict, List
 from HolonicTrader.holon_core import Holon, Disposition
 import config
-from HolonicTrader.agent_ppo import PPOHolon # Phase 22: The Monolith
+from HolonicTrader.agent_ppo import PPOHolon
 
 try:
     from performance_tracker import DatabaseManager, get_performance_data
@@ -18,10 +18,10 @@ except ImportError:
     # Fallback mock if not found during dev
     class DatabaseManager: 
         def get_win_rate(self): return 0.5
-    def get_performance_data(): return {'win_rate': 50.0}
+    def get_performance_data(): return {'win_rate': 50.0} 
 
-import datetime
 import time
+import datetime
 
 class GovernorHolon(Holon):
     def __init__(self, name: str = "GovernorAgent", initial_balance: float = None, db_manager: Any = None):
@@ -371,6 +371,131 @@ class GovernorHolon(Holon):
 
         return True
 
+    def _check_unified_protocol(self, symbol: str, asset_price: float, existing_pos: dict, whale_confirmed: bool, market_bias: float) -> bool:
+        """
+        Helper for Unified Control Protocol Checks (Micro Mode, Stacking, Cluster Risk).
+        Returns True if ALLOWED, False if BLOCKED.
+        """
+        # 1. MICRO-ACCOUNT MODE (Request F)
+        if config.MICRO_CAPITAL_MODE:
+            # A. NO STACKING
+            # A. REGIME STACKING CHECK
+            regime_key = self.regime_controller.get_current_regime() if self.regime_controller else 'MICRO'
+            max_stacks = config.REGIME_PERMISSIONS.get(regime_key, {}).get('max_stacks', 0)
+            
+            if existing_pos and max_stacks == 0:
+                print(f"[{self.name}] 🧊 MICRO FREEZE: Stacking disabled (Regime {regime_key}, Max Stacks {max_stacks}). Rejecting.")
+                return False
+            
+            # B. MAX POSITIONS CAP (Replaces Cluster Risk for Micro)
+            base_pos_limit = config.REGIME_PERMISSIONS.get(regime_key, {}).get('max_positions', config.MICRO_MAX_POSITIONS)
+            
+            # --- DYNAMIC FLOTILLA SIZING (User Request) ---
+            # Bull Market = More Slots
+            bonus_slots = 0
+            if market_bias > 0.8: bonus_slots = 4    # Euphoria (+4)
+            elif market_bias > 0.6: bonus_slots = 2  # Bullish (+2)
+            
+            max_pos_limit = base_pos_limit + bonus_slots
+            
+            if len(self.positions) >= max_pos_limit:
+                # Allow existing position to continue (e.g. if we are reducing/exiting?)
+                # Actually, calc_position_size is only for ENTRIES (Long/Short).
+                # Wait, if we are Shorting and we have a Long, it's a flip? Or if we have a Short and we Add?
+                # The 'existing_pos' check above handles stacking/adding.
+                # If we are here, 'existing_pos' is None, meaning NEW position.
+                print(f"[{self.name}] 🛑 MAX POSITIONS REACHED ({len(self.positions)}/{max_pos_limit}). Rejecting.")
+                return False
+                
+            # C. EXPOSURE CAP
+            # Check if adding a MINIMUM SIZED trade triggers the cap. 
+            # Real sizing happens later, this is just a gate.
+            estimated_exposure = config.MIN_ORDER_VALUE * 1.1 # 10% buffer
+            current_exposure = sum([p['quantity'] * p['entry_price'] for p in self.positions.values()])
+            
+            # --- PATCH: CORRECT NANO LIMIT ---
+            if regime_key == 'NANO':
+                 # Use NANO specific limit (10.0x) from permissions
+                 nano_limit_ratio = config.REGIME_PERMISSIONS['NANO']['max_exposure_ratio']
+                 max_allowed = self.balance * nano_limit_ratio
+            else:
+                 # Use Dynamic Limit based on Regime
+                 regime_limit_ratio = config.REGIME_PERMISSIONS.get(regime_key, {}).get('max_exposure_ratio', config.MICRO_MAX_EXPOSURE_RATIO)
+                 max_allowed = self.balance * regime_limit_ratio
+            
+            if (current_exposure + estimated_exposure) > max_allowed:
+                  print(f"[{self.name}] 🛑 EXPOSURE CAP REACHED (Pre-Check): Current ${current_exposure:.2f} + MinTrade > Limit ${max_allowed:.2f}")
+                  return False
+
+        # 2. LOW NAV FREEZE (Request A - Modified)
+        # Even if not in Micro mode, if funds are low, don't stack.
+        if self.balance < config.STACKING_MIN_EQUITY:
+            if existing_pos:
+                 # Check Free Margin Buffer
+                 # We need ~5x the min order value in FREE margin to justify a stack
+                 required_buffer = config.MIN_ORDER_VALUE * config.STACKING_BUFFER_MULTIPLIER
+                 if self.available_balance < required_buffer:
+                       print(f"[{self.name}] 🧊 LOW NAV FREEZE: Free Margin ${self.available_balance:.2f} < Buffer ${required_buffer:.2f}. Stacking Blocked.")
+                       return False
+
+        # --- PATCH 2: THE STACKING CAP (Stop the Martingale) ---
+        # FIXED: Removed hardcoded MAX_STACKS = 3. Rely purely on Regime permissions.
+        # --- PATCH 2: DYNAMIC STACKING (Profit-Financed Risk) ---
+        # "Earn Your Stacks": Max Stacks = Base Limit + Floor(Open Profit / 1R)
+        if existing_pos:
+            regime_key = self.regime_controller.get_current_regime() if self.regime_controller else 'MICRO'
+            base_limit = config.REGIME_PERMISSIONS.get(regime_key, {}).get('max_stacks', 0)
+            
+            # 🐳 WHALE BONUS
+            if whale_confirmed: 
+                base_limit += 2
+                
+            # 💰 PROFIT BONUS
+            # Calculate 1R (Risk Unit)
+            risk_unit = max(1.0, self.balance * config.MAX_RISK_PCT)
+            
+            # Calculate Open Profit (Unrealized)
+            open_profit = 0.0
+            entry_p = existing_pos.get('entry_price', 0.0)
+            qty_held = existing_pos.get('quantity', 0.0)
+            pos_dir = existing_pos.get('direction', 'BUY')
+            
+            if entry_p > 0 and asset_price > 0:
+                if pos_dir == 'BUY':
+                    open_profit = (asset_price - entry_p) * qty_held
+                else:
+                    open_profit = (entry_p - asset_price) * qty_held
+            
+            # Bonus = Floor(Profit / 1R)
+            bonus_stacks = 0
+            if open_profit > 0:
+                bonus_stacks = int(open_profit / risk_unit)
+                
+            dynamic_limit = base_limit + bonus_stacks
+            
+            # HARD CAP (Sanity)
+            HARD_CAP = 10
+            dynamic_limit = min(dynamic_limit, HARD_CAP)
+            
+            current_stacks = existing_pos.get('stack_count', 1)
+            
+            if current_stacks >= dynamic_limit:
+                 print(f"[{self.name}] 🛑 STACKING CAP: {current_stacks} >= {dynamic_limit} (Base {base_limit} + Bonus {bonus_stacks}). Profit ${open_profit:.2f} (1R=${risk_unit:.2f}). Rejecting.")
+                 return False
+            else:
+                 print(f"[{self.name}] 🥞 DYNAMIC STACK APPROVED: {current_stacks+1}/{dynamic_limit} (Bonus {bonus_stacks} from ${open_profit:.2f} profit)")
+                 
+        # -------------------------------------------------------
+        # -------------------------------------------------------
+
+        # --- PHASE 35: IMMUNE SYSTEM CHECKS ---
+        # Note: In Micro Mode, we might skip Cluster Risk if desired ("Ignore cluster risk" request)
+        if not config.MICRO_CAPITAL_MODE:
+            if not self.check_cluster_risk(symbol):
+                return False
+                
+        return True
+
     def calc_position_size(self, symbol: str, asset_price: float, current_atr: float = None, atr_ref: float = None, conviction: float = 0.5, direction: str = 'BUY', crisis_score: float = 0.0, sentiment_score: float = 0.0, whale_confirmed: bool = False, market_bias: float = 0.5, metadata: Dict[str, Any] = None) -> Tuple[bool, float, float]:
         """
         Calculate position size with Phase 12 institutional risk management.
@@ -434,6 +559,65 @@ class GovernorHolon(Holon):
              else:
                  print(f"[{self.name}] 🛑 REJECT {symbol}: Accumulator Lock Active (Drawdown limit hit).")
                  return False, 0.0, 1.0
+
+        # --- PHASE 25: SATELLITE OVERRIDE (High Value Snipers) ---
+        # FIX: Moved Correlation Guard HERE to prevent "Approved then Rejected" race conditions.
+        
+        # --- PHASE 40: CORRELATION GUARD (The Hedge) ---
+        # Prevent "All Eggs in One Basket"
+        # If we already hold an asset highly correlated (>0.85) to the candidate, VETO it.
+        # Exception: If directions are opposite (Hedge).
+        
+        # SMART CORRELATION (Phase 45): Relax constraints during Bull Runs
+        should_check_correlation = getattr(config, 'CORRELATION_CHECK', True)
+        
+        if sentiment_score > getattr(config, 'SENTIMENT_THRESHOLD_BULL', 0.2):
+             if self.DEBUG: print(f"[{self.name}] 🐂 BULL MARKET OVERRIDE: Disabling Correlation Check (Sent {sentiment_score:.2f} > 0.2)")
+             should_check_correlation = False
+
+        # 🐳 WHALE BYPASS (Optimized)
+        if whale_confirmed:
+             print(f"[{self.name}] 🐳 WHALE OVERRIDE: Disabling Correlation Guard for {symbol} (Whale Sighted)")
+             should_check_correlation = False
+             
+        if len(self.positions) > 0 and should_check_correlation:
+             # We need a correlation matrix. For now, we use "Family" variants as proxies or 
+             # the PPO Brain's memory if available. 
+             # Simpler: Hardcoded Map for Phase 1.
+             
+             # Map: {Asset: Family}
+             # BTC, ETH -> 'CRYPTO_MAJOR'
+             # SOL, AVAX -> 'L1_ROTATOR'
+             # DOGE, PEPE -> 'MEME_BASKET'
+             
+             families = {
+                 'BTC': 'BITCOIN', 'WBTC': 'BITCOIN',
+                 'ETH': 'ETHEREUM',
+                 'SOL': 'SOLANA', 'SUI': 'MOVE_L1', 'AVAX': 'EVM_L1', 'ADA': 'LEGACY_L1',
+                 'DOGE': 'MEME', 'SHIB': 'MEME', 'PEPE': 'MEME',
+                 'XRP': 'LEGACY_PAYMENT', 'LTC': 'LEGACY_PAYMENT'
+             }
+             
+             cand_base = symbol.split('/')[0]
+             cand_fam = families.get(cand_base, 'OTHER')
+             
+             for pos_sym, pos in self.positions.items():
+                 # Allow stacking of the SAME asset (this is handled by Stack Limits, not Correlation)
+                 if pos_sym == symbol: continue
+                 
+                 pos_base = pos_sym.split('/')[0]
+                 pos_fam = families.get(pos_base, 'OTHER')
+                 
+                 # If in same family AND same direction -> BLOCK
+                 if cand_fam != 'OTHER' and cand_fam == pos_fam:
+                     existing_dir = pos.get('direction', 'BUY')
+                     
+                     if existing_dir == direction:
+                         print(f"[{self.name}] 🔗 CORRELATION VETO: Rejecting {symbol} ({cand_fam}). Too similar to {pos_sym}.")
+                         return False, 0.0, 0.0
+                     else:
+                         print(f"[{self.name}] ⚖️ HEDGE DETECTED: Allowing {symbol} ({direction}) vs {pos_sym} ({existing_dir})")
+        # -----------------------------------------------
 
         # --- PHASE 25: SATELLITE OVERRIDE (High Value Snipers) ---
         # NANO GUARD: Disable Override in Nano Mode to ensure strict check at Patch 5a
@@ -509,180 +693,14 @@ class GovernorHolon(Holon):
         existing_pos = self.positions.get(symbol)
 
         # --- UNIFIED CONTROL PROTOCOL: MICRO MODE & STACKING GATES ---
-        
-        # 1. MICRO-ACCOUNT MODE (Request F)
-        if config.MICRO_CAPITAL_MODE:
-            # A. NO STACKING
-            # A. REGIME STACKING CHECK
-            regime_key = self.regime_controller.get_current_regime() if self.regime_controller else 'MICRO'
-            max_stacks = config.REGIME_PERMISSIONS.get(regime_key, {}).get('max_stacks', 0)
-            
-            if existing_pos and max_stacks == 0:
-                print(f"[{self.name}] 🧊 MICRO FREEZE: Stacking disabled (Regime {regime_key}, Max Stacks {max_stacks}). Rejecting.")
+        # FIX: Wrapped in check to allow Satellite/Vol-Window to override limits
+        if not is_override:
+            if not self._check_unified_protocol(symbol, asset_price, existing_pos, whale_confirmed, market_bias):
                 return False, 0.0, 0.0
-            
-            # B. MAX POSITIONS CAP (Replaces Cluster Risk for Micro)
-            base_pos_limit = config.REGIME_PERMISSIONS.get(regime_key, {}).get('max_positions', config.MICRO_MAX_POSITIONS)
-            
-            # --- DYNAMIC FLOTILLA SIZING (User Request) ---
-            # Bull Market = More Slots
-            bonus_slots = 0
-            if market_bias > 0.8: bonus_slots = 4    # Euphoria (+4)
-            elif market_bias > 0.6: bonus_slots = 2  # Bullish (+2)
-            
-            max_pos_limit = base_pos_limit + bonus_slots
-            
-            if len(self.positions) >= max_pos_limit:
-                # Allow existing position to continue (e.g. if we are reducing/exiting?)
-                # Actually, calc_position_size is only for ENTRIES (Long/Short).
-                # Wait, if we are Shorting and we have a Long, it's a flip? Or if we have a Short and we Add?
-                # The 'existing_pos' check above handles stacking/adding.
-                # If we are here, 'existing_pos' is None, meaning NEW position.
-                print(f"[{self.name}] 🛑 MAX POSITIONS REACHED ({len(self.positions)}/{max_pos_limit}). Rejecting.")
-                return False, 0.0, 0.0
-                
-            # C. EXPOSURE CAP
-            # Check if adding a MINIMUM SIZED trade triggers the cap. 
-            # Real sizing happens later, this is just a gate.
-            estimated_exposure = config.MIN_ORDER_VALUE * 1.1 # 10% buffer
-            current_exposure = sum([p['quantity'] * p['entry_price'] for p in self.positions.values()])
-            
-            # --- PATCH: CORRECT NANO LIMIT ---
-            if regime_key == 'NANO':
-                 # Use NANO specific limit (10.0x) from permissions
-                 nano_limit_ratio = config.REGIME_PERMISSIONS['NANO']['max_exposure_ratio']
-                 max_allowed = self.balance * nano_limit_ratio
-            else:
-                 # Use Dynamic Limit based on Regime
-                 regime_limit_ratio = config.REGIME_PERMISSIONS.get(regime_key, {}).get('max_exposure_ratio', config.MICRO_MAX_EXPOSURE_RATIO)
-                 max_allowed = self.balance * regime_limit_ratio
-            
-            if (current_exposure + estimated_exposure) > max_allowed:
-                  print(f"[{self.name}] 🛑 EXPOSURE CAP REACHED (Pre-Check): Current ${current_exposure:.2f} + MinTrade > Limit ${max_allowed:.2f}")
-                  return False, 0.0, 0.0
 
-        # 2. LOW NAV FREEZE (Request A - Modified)
-        # Even if not in Micro mode, if funds are low, don't stack.
-        if self.balance < config.STACKING_MIN_EQUITY:
-            if existing_pos:
-                 # Check Free Margin Buffer
-                 # We need ~5x the min order value in FREE margin to justify a stack
-                 required_buffer = config.MIN_ORDER_VALUE * config.STACKING_BUFFER_MULTIPLIER
-                 if self.available_balance < required_buffer:
-                       print(f"[{self.name}] 🧊 LOW NAV FREEZE: Free Margin ${self.available_balance:.2f} < Buffer ${required_buffer:.2f}. Stacking Blocked.")
-                       return False, 0.0, 0.0
+            
+        # (Correlation Guard moved to top of function to prevent race conditions)
 
-        # --- PATCH 2: THE STACKING CAP (Stop the Martingale) ---
-        # FIXED: Removed hardcoded MAX_STACKS = 3. Rely purely on Regime permissions.
-        # --- PATCH 2: DYNAMIC STACKING (Profit-Financed Risk) ---
-        # "Earn Your Stacks": Max Stacks = Base Limit + Floor(Open Profit / 1R)
-        if existing_pos:
-            regime_key = self.regime_controller.get_current_regime() if self.regime_controller else 'MICRO'
-            base_limit = config.REGIME_PERMISSIONS.get(regime_key, {}).get('max_stacks', 0)
-            
-            # 🐳 WHALE BONUS
-            if whale_confirmed: 
-                base_limit += 2
-                
-            # 💰 PROFIT BONUS
-            # Calculate 1R (Risk Unit)
-            risk_unit = max(1.0, self.balance * config.MAX_RISK_PCT)
-            
-            # Calculate Open Profit (Unrealized)
-            open_profit = 0.0
-            entry_p = existing_pos.get('entry_price', 0.0)
-            qty_held = existing_pos.get('quantity', 0.0)
-            pos_dir = existing_pos.get('direction', 'BUY')
-            
-            if entry_p > 0 and asset_price > 0:
-                if pos_dir == 'BUY':
-                    open_profit = (asset_price - entry_p) * qty_held
-                else:
-                    open_profit = (entry_p - asset_price) * qty_held
-            
-            # Bonus = Floor(Profit / 1R)
-            bonus_stacks = 0
-            if open_profit > 0:
-                bonus_stacks = int(open_profit / risk_unit)
-                
-            dynamic_limit = base_limit + bonus_stacks
-            
-            # HARD CAP (Sanity)
-            HARD_CAP = 10
-            dynamic_limit = min(dynamic_limit, HARD_CAP)
-            
-            current_stacks = existing_pos.get('stack_count', 1)
-            
-            if current_stacks >= dynamic_limit:
-                 print(f"[{self.name}] 🛑 STACKING CAP: {current_stacks} >= {dynamic_limit} (Base {base_limit} + Bonus {bonus_stacks}). Profit ${open_profit:.2f} (1R=${risk_unit:.2f}). Rejecting.")
-                 return False, 0.0, 0.0
-            else:
-                 print(f"[{self.name}] 🥞 DYNAMIC STACK APPROVED: {current_stacks+1}/{dynamic_limit} (Bonus {bonus_stacks} from ${open_profit:.2f} profit)")
-                 
-        # -------------------------------------------------------
-        # -------------------------------------------------------
-
-        # --- PHASE 35: IMMUNE SYSTEM CHECKS ---
-        # Note: In Micro Mode, we might skip Cluster Risk if desired ("Ignore cluster risk" request)
-        if not config.MICRO_CAPITAL_MODE:
-            if not self.check_cluster_risk(symbol):
-                return False, 0.0, 0.0
-            
-        # --- PHASE 40: CORRELATION GUARD (The Hedge) ---
-        # Prevent "All Eggs in One Basket"
-        # If we already hold an asset highly correlated (>0.85) to the candidate, VETO it.
-        # Exception: If directions are opposite (Hedge).
-        
-        # SMART CORRELATION (Phase 45): Relax constraints during Bull Runs
-        should_check_correlation = getattr(config, 'CORRELATION_CHECK', True)
-        
-        if sentiment_score > getattr(config, 'SENTIMENT_THRESHOLD_BULL', 0.2):
-             if self.DEBUG: print(f"[{self.name}] 🐂 BULL MARKET OVERRIDE: Disabling Correlation Check (Sent {sentiment_score:.2f} > 0.2)")
-             should_check_correlation = False
-
-        # 🐳 WHALE BYPASS (Optimized)
-        if whale_confirmed:
-             print(f"[{self.name}] 🐳 WHALE OVERRIDE: Disabling Correlation Guard for {symbol} (Whale Sighted)")
-             should_check_correlation = False
-             
-        if len(self.positions) > 0 and should_check_correlation:
-             # We need a correlation matrix. For now, we use "Family" variants as proxies or 
-             # the PPO Brain's memory if available. 
-             # Simpler: Hardcoded Map for Phase 1.
-             
-             # Map: {Asset: Family}
-             # BTC, ETH -> 'CRYPTO_MAJOR'
-             # SOL, AVAX -> 'L1_ROTATOR'
-             # DOGE, PEPE -> 'MEME_BASKET'
-             
-             families = {
-                 'BTC': 'BITCOIN', 'WBTC': 'BITCOIN',
-                 'ETH': 'ETHEREUM',
-                 'SOL': 'SOLANA', 'SUI': 'MOVE_L1', 'AVAX': 'EVM_L1', 'ADA': 'LEGACY_L1',
-                 'DOGE': 'MEME', 'SHIB': 'MEME', 'PEPE': 'MEME',
-                 'XRP': 'LEGACY_PAYMENT', 'LTC': 'LEGACY_PAYMENT'
-             }
-             
-             cand_base = symbol.split('/')[0]
-             cand_fam = families.get(cand_base, 'OTHER')
-             
-             for pos_sym, pos in self.positions.items():
-                 # Allow stacking of the SAME asset (this is handled by Stack Limits, not Correlation)
-                 if pos_sym == symbol: continue
-                 
-                 pos_base = pos_sym.split('/')[0]
-                 pos_fam = families.get(pos_base, 'OTHER')
-                 
-                 # If in same family AND same direction -> BLOCK
-                 if cand_fam != 'OTHER' and cand_fam == pos_fam:
-                     existing_dir = pos.get('direction', 'BUY')
-                     
-                     if existing_dir == direction:
-                         print(f"[{self.name}] 🔗 CORRELATION VETO: Rejecting {symbol} ({cand_fam}). Too similar to {pos_sym}.")
-                         return False, 0.0, 0.0
-                     else:
-                         print(f"[{self.name}] ⚖️ HEDGE DETECTED: Allowing {symbol} ({direction}) vs {pos_sym} ({existing_dir})")
-        # -----------------------------------------------
 
         # 1. Minimax Constraint (The "House Money" Rule)
         max_loss_usd = self.calculate_max_risk(self.balance)
@@ -698,11 +716,7 @@ class GovernorHolon(Holon):
             print(f"[{self.name}] REJECTED: Cooldown active for {symbol} ({int(config.GOVERNOR_COOLDOWN_SECONDS - (time.time() - last_time))}s rem).")
             return False, 0.0, 0.0
             
-        # 2. Solvency Check (New)
-        # Cost = (Qty * Price) / Leverage
-        # But we don't know Qty yet. We are calculating it.
-        # Let's verify AFTER calculation.
-        pass # Placeholder
+
         
         # 3. Minimax Sizing
         # ... sizing logic ...
